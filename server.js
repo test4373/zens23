@@ -2441,20 +2441,38 @@ app.get("/hls/:magnet/:filename/master.m3u8", async (req, res) => {
   }
 });
 
-// HLS segments endpoint - REMOVED
+// Serve HLS segments (ACTIVE)
 app.get("/hls/:magnet/:filename/:segment", async (req, res) => {
-  res.status(404).json({ 
-    error: 'HLS removed',
-    message: 'Use direct streaming for bandwidth efficiency'
-  });
+  const { magnet, filename, segment } = req.params;
+  const videoHash = Buffer.from(decodeURIComponent(filename)).toString('base64').replace(/[/+=]/g, '_');
+  const videoCacheDir = path.join(hlsCacheDir, videoHash);
+  const segmentPath = path.join(videoCacheDir, segment);
+  
+  if (!fs.existsSync(segmentPath)) {
+    console.log(chalk.red('❌ Segment not found:'), segment);
+    return res.status(404).send('Segment not found');
+  }
+  
+  // Serve with aggressive caching
+  res.setHeader('Content-Type', segment.endsWith('.m3u8') ? 'application/vnd.apple.mpegurl' : 'video/mp2t');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+  
+  fs.createReadStream(segmentPath).pipe(res);
 });
 
-// HLS cache clearing - NOT NEEDED ANYMORE
+// Clear HLS cache (ACTIVE)
 app.delete("/hls/cache/clear", (req, res) => {
-  res.json({ 
-    success: true, 
-    message: 'HLS cache system removed - no cache to clear!' 
-  });
+  try {
+    if (fs.existsSync(hlsCacheDir)) {
+      fs.rmSync(hlsCacheDir, { recursive: true, force: true });
+      fs.mkdirSync(hlsCacheDir, { recursive: true });
+      console.log(chalk.green('✅ HLS cache cleared'));
+    }
+    res.json({ success: true, message: 'Cache cleared' });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to clear cache' });
+  }
 });
 */
 /* ============================================================= */
