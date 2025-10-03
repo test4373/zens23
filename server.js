@@ -96,6 +96,10 @@ if (fs.existsSync(localSubsDir)) {
 }
 
 const app = express();
+
+// 🔧 CRITICAL: Trust proxy for Render.com (behind reverse proxy)
+app.set('trust proxy', 1); // Trust first proxy
+
 // WebTorrent client - ULTRA LOW BANDWIDTH MODE
 const client = new WebTorrent({
   maxConns: 20,         // Limit connections to save bandwidth
@@ -120,8 +124,27 @@ app.use(helmet({
   crossOriginResourcePolicy: { policy: "cross-origin" },
   contentSecurityPolicy: false // Video streaming için
 }));
+// Dynamic CORS - Accept localhost and Render.com
+const allowedOrigins = [
+  'http://localhost:5173',
+  'http://localhost:5174',
+  'http://127.0.0.1:5173',
+  'http://127.0.0.1:5174'
+];
+
 app.use(cors({
-  origin: ['http://localhost:5173', 'http://localhost:5174'],
+  origin: function (origin, callback) {
+    // Allow requests with no origin (Postman, mobile apps, curl, etc.)
+    if (!origin) return callback(null, true);
+    
+    // Allow localhost in any form
+    if (allowedOrigins.includes(origin) || origin.includes('localhost') || origin.includes('127.0.0.1')) {
+      callback(null, true);
+    } else {
+      console.log(chalk.yellow('⚠️  CORS blocked origin:'), origin);
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS', 'HEAD'],
   allowedHeaders: ['Content-Type', 'Authorization'],
@@ -143,13 +166,15 @@ const limiter = rateLimit({
   message: 'Çok fazla istek gönderdiniz, lütfen daha sonra tekrar deneyin',
   standardHeaders: true,
   legacyHeaders: false,
+  trustProxy: true, // Enable for Render.com
 });
 
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 5, // 15 dakikada maksimum 5 login/register denemesi
+  max: 100, // 15 dakikada maksimum 100 login/register denemesi (artırıldı)
   message: 'Çok fazla giriş denemesi, lütfen 15 dakika sonra tekrar deneyin',
-  skipSuccessfulRequests: true
+  skipSuccessfulRequests: true,
+  trustProxy: true, // Enable for Render.com
 });
 
 // Apply rate limiter only to sensitive endpoints
