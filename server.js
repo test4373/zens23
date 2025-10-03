@@ -643,7 +643,7 @@ app.get("/details/:magnet", async (req, res) => {
 });
 
 /* --------------- Handling VLC streaming --------------- */
-import { exec } from "child_process";
+import { exec, spawn } from "child_process";
 import { get } from "http";
 import fetch from "node-fetch";
 import { promisify } from "util";
@@ -2074,8 +2074,6 @@ const hlsCacheDir = path.join(__dirname, 'hls_cache');
 if (!fs.existsSync(hlsCacheDir)) {
   fs.mkdirSync(hlsCacheDir, { recursive: true });
 }
-
-import { spawn } from 'child_process';
 
 // 🚀 OPTIMIZED HLS - Multi-quality adaptive streaming
 app.get("/hls/:magnet/:filename/master.m3u8", async (req, res) => {
