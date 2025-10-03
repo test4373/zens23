@@ -2067,19 +2067,168 @@ app.get("/auto-subtitle/:animeName/:episode", async (req, res) => {
 });
 /* ============================================================= */
 
-/* ========== HLS REMOVED - Using Direct Streaming Instead ========== */
-// HLS çok karmaşık ve gereksiz bandwidth kullanıyor.
-// Bunun yerine direkt /streamfile endpoint'i kullan.
-// Audio/Subtitle track switching için /stream-info kullan.
-/* =================================================================== */
+/* ========== ADAPTIVE BITRATE STREAMING (HLS) ========== */
+// 🍎 Apple HLS Support - Multi-bitrate streaming
+// HLS cache directory
+const hlsCacheDir = path.join(__dirname, 'hls_cache');
+if (!fs.existsSync(hlsCacheDir)) {
+  fs.mkdirSync(hlsCacheDir, { recursive: true });
+}
 
-// HLS endpoint kaldırıldı - 404 döndür
+import { spawn } from 'child_process';
+
+// 🚀 OPTIMIZED HLS - Multi-quality adaptive streaming
 app.get("/hls/:magnet/:filename/master.m3u8", async (req, res) => {
-  res.status(404).json({ 
-    error: 'HLS removed',
-    message: 'Use /streamfile endpoint instead for better bandwidth efficiency',
-    alternative: '/streamfile/:magnet/:filename'
-  });
+  let magnet = req.params.magnet;
+  let filename = decodeURIComponent(req.params.filename);
+  
+  console.log(chalk.cyan('🎥 === HLS REQUEST (ADAPTIVE) ==='));
+  console.log(chalk.yellow('  File:'), filename);
+  
+  let tor = await client.get(magnet);
+  if (!tor) {
+    return res.status(404).send('Torrent not found');
+  }
+  
+  const videoFile = tor.files.find(f => f.name === filename);
+  if (!videoFile) {
+    return res.status(404).send('Video file not found');
+  }
+  
+  const videoPath = path.join(tor.path, videoFile.path);
+  
+  // Wait for file
+  let retries = 0;
+  while (!fs.existsSync(videoPath) && retries < 10) {
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    retries++;
+  }
+  
+  if (!fs.existsSync(videoPath)) {
+    return res.status(404).send('Video not ready');
+  }
+  
+  // Create cache dir for this video
+  const videoHash = Buffer.from(filename).toString('base64').replace(/[/+=]/g, '_');
+  const videoCacheDir = path.join(hlsCacheDir, videoHash);
+  const masterPlaylistPath = path.join(videoCacheDir, 'master.m3u8');
+  
+  // Check cache
+  if (fs.existsSync(masterPlaylistPath)) {
+    console.log(chalk.green('✅ Using cached HLS'));
+    const playlist = fs.readFileSync(masterPlaylistPath, 'utf-8');
+    res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+    return res.send(playlist);
+  }
+  
+  if (!fs.existsSync(videoCacheDir)) {
+    fs.mkdirSync(videoCacheDir, { recursive: true });
+  }
+  
+  console.log(chalk.cyan('🔄 Converting to HLS (multi-quality)...'));
+  
+  try {
+    // OPTIMIZED: Generate 3 quality variants (720p, 1080p, Auto)
+    const qualities = [
+      { name: '720p', height: 720, bitrate: '2500k', audioBitrate: '128k' },
+      { name: '1080p', height: 1080, bitrate: '5000k', audioBitrate: '192k' },
+    ];
+    
+    const variantPromises = qualities.map((quality, idx) => {
+      return new Promise((resolve, reject) => {
+        const playlistName = `variant_${quality.name}.m3u8`;
+        const playlistPath = path.join(videoCacheDir, playlistName);
+        
+        console.log(chalk.yellow(`  🎬 Generating ${quality.name}...`));
+        
+        const args = [
+          '-i', videoPath,
+          '-vf', `scale=-2:${quality.height}`,
+          '-c:v', 'libx264',
+          '-b:v', quality.bitrate,
+          '-c:a', 'aac',
+          '-b:a', quality.audioBitrate,
+          '-preset', 'veryfast',
+          '-hls_time', '6',
+          '-hls_list_size', '0',
+          '-hls_segment_filename', path.join(videoCacheDir, `${quality.name}_seg%03d.ts`),
+          '-f', 'hls',
+          playlistPath
+        ];
+        
+        const proc = spawn(ffmpegPath.path, args);
+        
+        proc.on('close', (code) => {
+          if (code === 0) {
+            console.log(chalk.green(`    ✅ ${quality.name} done`));
+            resolve({ name: playlistName, ...quality });
+          } else {
+            reject(new Error(`${quality.name} failed`));
+          }
+        });
+        
+        proc.on('error', reject);
+      });
+    });
+    
+    const variants = await Promise.all(variantPromises);
+    
+    // Create master playlist
+    let masterContent = '#EXTM3U\n#EXT-X-VERSION:3\n\n';
+    
+    variants.forEach(variant => {
+      const bandwidth = parseInt(variant.bitrate) * 1000;
+      masterContent += `#EXT-X-STREAM-INF:BANDWIDTH=${bandwidth},RESOLUTION=${variant.height === 720 ? '1280x720' : '1920x1080'}\n`;
+      masterContent += `${variant.name}\n`;
+    });
+    
+    fs.writeFileSync(masterPlaylistPath, masterContent);
+    console.log(chalk.green('✅ Master playlist created with'), variants.length, 'quality variants');
+    
+    res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+    res.send(masterContent);
+    
+  } catch (error) {
+    console.error(chalk.red('❌ HLS error:'), error.message);
+    res.status(500).send('HLS conversion failed');
+  }
+});
+
+// Serve HLS segments
+app.get("/hls/:magnet/:filename/:segment", async (req, res) => {
+  const { magnet, filename, segment } = req.params;
+  const videoHash = Buffer.from(decodeURIComponent(filename)).toString('base64').replace(/[/+=]/g, '_');
+  const videoCacheDir = path.join(hlsCacheDir, videoHash);
+  const segmentPath = path.join(videoCacheDir, segment);
+  
+  if (!fs.existsSync(segmentPath)) {
+    return res.status(404).send('Segment not found');
+  }
+  
+  // Serve with aggressive caching
+  res.setHeader('Content-Type', segment.endsWith('.m3u8') ? 'application/vnd.apple.mpegurl' : 'video/mp2t');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Cache-Control', 'public, max-age=31536000, immutable'); // 1 year!
+  
+  fs.createReadStream(segmentPath).pipe(res);
+});
+
+// Clear HLS cache
+app.delete("/hls/cache/clear", (req, res) => {
+  try {
+    if (fs.existsSync(hlsCacheDir)) {
+      fs.rmSync(hlsCacheDir, { recursive: true, force: true });
+      fs.mkdirSync(hlsCacheDir, { recursive: true });
+      console.log(chalk.green('✅ HLS cache cleared'));
+    }
+    res.json({ success: true, message: 'Cache cleared' });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to clear cache' });
+  }
 });
 
 /* OLD HLS CODE - REMOVED FOR BANDWIDTH OPTIMIZATION
