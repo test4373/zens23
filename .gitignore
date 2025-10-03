@@ -1,0 +1,8 @@
+node_modules/
+.vercel/
+hls_cache/
+temp_subs/
+downloads/
+*.db
+*.log
+.env

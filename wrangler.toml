@@ -1,0 +1,25 @@
+# Cloudflare Workers Configuration
+# FREE: 100k requests/day + 10 GB bandwidth
+
+name = "zenshin-cdn"
+main = "cloudflare-worker.js"
+compatibility_date = "2024-01-01"
+
+# Account details (get from Cloudflare dashboard)
+account_id = "YOUR_ACCOUNT_ID"  # https://dash.cloudflare.com -> Workers -> Account ID
+
+# Routes (optional)
+# route = "example.com/*"
+
+# Environment variables
+[vars]
+CACHE_DURATION = "3600"
+MAX_BANDWIDTH = "10485760"  # 10 MB/s
+
+# KV namespaces (optional - for advanced caching)
+# [[kv_namespaces]]
+# binding = "VIDEO_CACHE"
+# id = "your-kv-namespace-id"
+
+# Deploy command:
+# npx wrangler deploy

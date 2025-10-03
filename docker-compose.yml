@@ -1,0 +1,70 @@
+version: '3.8'
+
+services:
+  backend:
+    build: .
+    container_name: zenshin-backend
+    restart: unless-stopped
+    
+    ports:
+      - "64621:64621"
+      - "3000:3000"  # API port
+    
+    volumes:
+      # Persist downloads and database
+      - ./downloads:/app/downloads
+      - ./database.sqlite:/app/database.sqlite
+      - ./temp_subs:/app/temp_subs
+      - ./logs:/app/logs
+    
+    environment:
+      - NODE_ENV=production
+      - PORT=64621
+    
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '1'
+          memory: 512M
+    
+    # Logging
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:64621/ping')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # Optional: Nginx reverse proxy
+  nginx:
+    image: nginx:alpine
+    container_name: zenshin-nginx
+    restart: unless-stopped
+    
+    ports:
+      - "80:80"
+      - "443:443"
+    
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    
+    depends_on:
+      - backend
+    
+    profiles:
+      - with-nginx  # Optional service
+
+volumes:
+  downloads:
+  logs:

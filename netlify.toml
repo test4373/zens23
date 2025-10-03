@@ -1,0 +1,31 @@
+# Netlify Configuration
+# FREE: 100 GB bandwidth/month + Unlimited requests
+
+[build]
+  publish = "."
+  command = "echo 'No build needed'"
+
+# Edge Functions
+[[edge_functions]]
+  function = "cdn"
+  path = "/api/cdn"
+
+# Headers for CORS and caching
+[[headers]]
+  for = "/api/*"
+  [headers.values]
+    Access-Control-Allow-Origin = "*"
+    Access-Control-Allow-Methods = "GET, POST, PUT, DELETE, OPTIONS"
+    Access-Control-Allow-Headers = "Content-Type, Range, Authorization"
+    Cache-Control = "public, max-age=3600, stale-while-revalidate=86400"
+
+# Redirects (optional)
+# [[redirects]]
+#   from = "/cdn/*"
+#   to = "/api/cdn?url=:splat"
+#   status = 200
+
+# Environment variables (optional)
+[context.production.environment]
+  NODE_ENV = "production"
+  CACHE_DURATION = "3600"
