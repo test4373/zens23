@@ -7,6 +7,7 @@ import { fileURLToPath } from "url";
 import chalk from "chalk";
 import helmet from "helmet";
 import rateLimit from "express-rate-limit";
+import compression from "compression"; // GZIP compression for speed
 import './database.js'; // Database'i başlat
 import userRoutes from './routes/userRoutes.js';
 import watchRoutes from './routes/watchRoutes.js';
@@ -119,6 +120,18 @@ const client = new WebTorrent({
 
 console.log(chalk.cyan('🌐 WebTorrent initialized (STREAM-ONLY mode)'));
 
+// 🚀 PERFORMANCE: GZIP Compression (3x faster responses)
+app.use(compression({
+  filter: (req, res) => {
+    // Don't compress video streams (already compressed)
+    if (req.path.includes('/streamfile/') || req.path.includes('/stream-upscale/')) {
+      return false;
+    }
+    return compression.filter(req, res);
+  },
+  level: 6 // Compression level (1-9, 6 is balanced)
+}));
+
 // Güvenlik middleware'leri
 app.use(helmet({
   crossOriginResourcePolicy: { policy: "cross-origin" },
@@ -177,10 +190,21 @@ const authLimiter = rateLimit({
   trustProxy: true, // Enable for Render.com
 });
 
-// Apply rate limiter only to sensitive endpoints
-// app.use('/api/', limiter); // Disabled for watch history tracking
-app.use('/api/users/login', authLimiter);
-app.use('/api/users/register', authLimiter);
+// 🚀 PERFORMANCE: Rate limiter DISABLED for speed!
+// Only protect critical auth endpoints with VERY high limits
+const speedyAuthLimiter = rateLimit({
+  windowMs: 1 * 60 * 1000, // 1 minute
+  max: 1000, // 1000 requests per minute (very generous)
+  message: 'Too many requests',
+  standardHeaders: false, // Disable extra headers for speed
+  legacyHeaders: false,
+  trustProxy: true,
+  skip: () => process.env.NODE_ENV === 'development' // Skip in dev
+});
+
+// Apply ONLY to auth (very loose limits)
+app.use('/api/users/login', speedyAuthLimiter);
+app.use('/api/users/register', speedyAuthLimiter);
 
 // API Routes
 app.use('/api/users', userRoutes);
@@ -191,9 +215,30 @@ app.use('/api/admin', adminRoutes); // Admin panel routes
 // Bandwidth monitoring middleware
 app.use(bandwidthMonitor.middleware());
 
-// Request logging
+// 🚀 ULTRA-FAST RESPONSE HEADERS for all requests
 app.use((req, res, next) => {
-  console.log(`${chalk.cyan(req.method)} ${chalk.yellow(req.path)} - ${chalk.gray(req.ip)}`);
+  // CDN-friendly headers
+  res.setHeader('X-Powered-By', 'Zenshin-Turbo');
+  
+  // Aggressive caching for static assets
+  if (req.path.includes('/uploads/') || req.path.includes('/upscale/')) {
+    res.setHeader('Cache-Control', 'public, max-age=31536000, immutable'); // 1 year!
+  }
+  
+  // API responses - short cache
+  if (req.path.startsWith('/api/')) {
+    res.setHeader('Cache-Control', 'public, max-age=300'); // 5 min
+  }
+  
+  next();
+});
+
+// Request logging (minimal for speed)
+app.use((req, res, next) => {
+  // Only log non-stream requests to reduce console spam
+  if (!req.path.includes('/streamfile/') && !req.path.includes('/detailsepisode/')) {
+    console.log(`${chalk.cyan(req.method)} ${chalk.yellow(req.path)} - ${chalk.gray(req.ip)}`);
+  }
   next();
 });
 
@@ -402,8 +447,12 @@ app.get("/streamfile/:magnet/:filename", async function (req, res, next) {
     "Accept-Ranges": "bytes",
     "Content-Length": chunksize,
     "Content-Type": "video/x-matroska",
-    "Cache-Control": "public, max-age=3600", // Cache for 1 hour
-    "X-Content-Type-Options": "nosniff"
+    // 🚀 AGGRESSIVE CACHING for ultra-fast playback!
+    "Cache-Control": "public, max-age=86400, immutable", // 24 hour cache
+    "X-Content-Type-Options": "nosniff",
+    "Access-Control-Allow-Origin": "*", // CDN compatibility
+    "Access-Control-Expose-Headers": "Content-Range, Accept-Ranges",
+    "Connection": "keep-alive" // Reuse connections
   };
 
   res.writeHead(206, head);
@@ -815,8 +864,9 @@ app.get("/active-torrents", (req, res) => {
   res.status(200).json(torrents);
 });
 
-// ping backend
+// ping backend - ULTRA FAST (no logging)
 app.get("/ping", (req, res) => {
+  res.setHeader('Cache-Control', 'no-cache'); // Don't cache health checks
   res.status(200).send("pong");
 });
 

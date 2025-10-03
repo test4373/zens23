@@ -15,7 +15,7 @@ export const CDN_CONFIG = {
   
   // ✅ Netlify Edge (BEST - 100 GB/MONTH, sınırsız istek)
   netlify: {
-    enabled: false,  // Vercel kullanıyoruz
+    enabled: false,  // Backend Render.com'da
     edgeUrl: 'https://your-site.netlify.app/api',
     limits: 'Unlimited requests',
     bandwidth: '100 GB/month',
