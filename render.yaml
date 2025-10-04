@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: zenshin-backend
+    env: node
+    region: frankfurt
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000
+      - key: CORS_ORIGIN
+        sync: false
+      - key: GDRIVE_CLIENT_ID
+        sync: false
+      - key: GDRIVE_CLIENT_SECRET
+        sync: false
+      - key: GDRIVE_REFRESH_TOKEN
+        sync: false
+    healthCheckPath: /health
+    autoDeploy: true

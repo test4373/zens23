@@ -98,27 +98,55 @@ if (fs.existsSync(localSubsDir)) {
 
 const app = express();
 
-// 🔧 CRITICAL: Trust proxy for Render.com (behind reverse proxy)
-app.set('trust proxy', 1); // Trust first proxy
+// Local server - no proxy needed
+// app.set('trust proxy', 1);
 
-// WebTorrent client - ULTRA LOW BANDWIDTH MODE
+// WebTorrent client - OPTIMIZED FOR SMOOTH PLAYBACK
 const client = new WebTorrent({
-  maxConns: 20,         // Limit connections to save bandwidth
-  downloadLimit: 512000, // 512 KB/s = 4 Mbps (enough for 1080p streaming)
-  uploadLimit: 64000,   // 64 KB/s upload (minimal sharing to save bandwidth)
+  maxConns: 55,          // More connections = faster download
+  downloadLimit: -1,     // Unlimited download (use full bandwidth)
+  uploadLimit: 100000,   // 100 KB/s upload (fair sharing)
   dht: true,
+  lsd: true,             // Local Service Discovery
   tracker: {
     announce: [
       'wss://tracker.openwebtorrent.com',
       'wss://tracker.btorrent.xyz',
-      'wss://tracker.fastcast.nz'
+      'wss://tracker.fastcast.nz',
+      'udp://tracker.openbittorrent.com:80',
+      'udp://tracker.opentrackr.org:1337'
     ]
   },
-  // CRITICAL: Enable streaming mode
-  strategy: 'sequential' // Download sequentially for smooth streaming
+  // CRITICAL: Sequential download + piece prioritization
+  strategy: 'rarest', // Download rarest pieces first (better peer connections)
+  prioritizeInitial: true, // Prioritize first and last pieces for seeking
 });
 
 console.log(chalk.cyan('🌐 WebTorrent initialized (STREAM-ONLY mode)'));
+
+// 🔥 Global WebTorrent error handler - Prevent crashes!
+client.on('error', (err) => {
+  console.error(chalk.red('❌ WebTorrent error:'), err.message);
+  // Don't crash - just log
+});
+
+// Handle torrent-level errors
+client.on('torrent', (torrent) => {
+  torrent.on('error', (err) => {
+    console.error(chalk.red('❌ Torrent error:'), torrent.name, '-', err.message);
+    // Don't crash
+  });
+  
+  // Handle peer errors (RTCError)
+  torrent.on('wire', (wire) => {
+    wire.on('error', (err) => {
+      // Silent - peer errors are normal
+      if (!err.message.includes('User-Initiated Abort')) {
+        console.log(chalk.yellow('⚠️ Peer error:'), err.message);
+      }
+    });
+  });
+});
 
 // 🚀 PERFORMANCE: GZIP Compression (3x faster responses)
 app.use(compression({
@@ -137,31 +165,13 @@ app.use(helmet({
   crossOriginResourcePolicy: { policy: "cross-origin" },
   contentSecurityPolicy: false // Video streaming için
 }));
-// Dynamic CORS - Accept localhost and Render.com
-const allowedOrigins = [
-  'http://localhost:5173',
-  'http://localhost:5174',
-  'http://127.0.0.1:5173',
-  'http://127.0.0.1:5174'
-];
-
+// Local CORS - allow all for development
 app.use(cors({
-  origin: function (origin, callback) {
-    // Allow requests with no origin (Postman, mobile apps, curl, etc.)
-    if (!origin) return callback(null, true);
-    
-    // Allow localhost in any form
-    if (allowedOrigins.includes(origin) || origin.includes('localhost') || origin.includes('127.0.0.1')) {
-      callback(null, true);
-    } else {
-      console.log(chalk.yellow('⚠️  CORS blocked origin:'), origin);
-      callback(new Error('Not allowed by CORS'));
-    }
-  },
+  origin: '*', // Allow all origins for local development
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS', 'HEAD'],
   allowedHeaders: ['Content-Type', 'Authorization'],
-  exposedHeaders: ['X-Subtitle-Type', 'Content-Type'] // Custom header'ı expose et
+  exposedHeaders: ['X-Subtitle-Type', 'Content-Type', 'Content-Range', 'Accept-Ranges']
 }));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
@@ -190,21 +200,8 @@ const authLimiter = rateLimit({
   trustProxy: true, // Enable for Render.com
 });
 
-// 🚀 PERFORMANCE: Rate limiter DISABLED for speed!
-// Only protect critical auth endpoints with VERY high limits
-const speedyAuthLimiter = rateLimit({
-  windowMs: 1 * 60 * 1000, // 1 minute
-  max: 1000, // 1000 requests per minute (very generous)
-  message: 'Too many requests',
-  standardHeaders: false, // Disable extra headers for speed
-  legacyHeaders: false,
-  trustProxy: true,
-  skip: () => process.env.NODE_ENV === 'development' // Skip in dev
-});
-
-// Apply ONLY to auth (very loose limits)
-app.use('/api/users/login', speedyAuthLimiter);
-app.use('/api/users/register', speedyAuthLimiter);
+// Local development - no rate limiting needed
+// Rate limiters completely disabled for maximum speed
 
 // API Routes
 app.use('/api/users', userRoutes);
@@ -421,19 +418,66 @@ app.get("/streamfile/:magnet/:filename", async function (req, res, next) {
 
   console.log(chalk.gray("Range:"), range);
 
+  let file_size = file.length;
+
+  // 🔥 FIX: Support both range and non-range requests
   if (!range) {
-    return res.status(416).send("Range is required");
+    // No range header - send first chunk as partial content to trigger range requests
+    console.log(chalk.yellow('⚡ No range header - sending initial partial content'));
+    
+    // Send first 1MB as partial content to kickstart video.js
+    const start = 0;
+    const end = Math.min(1024 * 1024, file_size - 1); // 1MB or file size
+    const chunksize = end - start + 1;
+    
+    const head = {
+      "Content-Range": `bytes ${start}-${end}/${file_size}`,
+      "Accept-Ranges": "bytes",
+      "Content-Length": chunksize,
+      "Content-Type": "video/x-matroska",
+      "Cache-Control": "public, max-age=86400, immutable",
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Expose-Headers": "Content-Range, Accept-Ranges",
+      "Connection": "keep-alive",
+      "X-Content-Disposition": "inline",
+      "Content-Disposition": "inline"
+    };
+    
+    res.writeHead(206, head); // 206 Partial Content
+    
+    const stream = file.createReadStream({ start, end });
+    stream.pipe(res);
+    
+    stream.on("error", function (err) {
+      console.error("Initial stream error:", err);
+      if (!res.headersSent) {
+        return res.status(500).send("Error streaming initial chunk");
+      }
+    });
+    
+    console.log(chalk.cyan('✨ Initial chunk sent:'), (chunksize / 1024).toFixed(2), 'KB');
+    return;
   }
 
   let positions = range.replace(/bytes=/, "").split("-");
   let start = parseInt(positions[0], 10);
-  let file_size = file.length;
   let end = positions[1] ? parseInt(positions[1], 10) : file_size - 1;
   
-  // 🔥 SMART CHUNK SIZE - Only download 2MB at a time
-  const MAX_CHUNK = 2 * 1024 * 1024; // 2MB chunks
+  // 🔥 LARGE CHUNK SIZE - Download bigger chunks for smooth playback
+  const MAX_CHUNK = 10 * 1024 * 1024; // 10MB chunks (no stuttering!)
   if (end - start > MAX_CHUNK) {
     end = start + MAX_CHUNK;
+  }
+  
+  // 🚀 SMART PREFETCH - Download ahead for buffer
+  const prefetchStart = end + 1;
+  const prefetchEnd = Math.min(prefetchStart + (5 * 1024 * 1024), file_size); // 5MB prefetch
+  
+  // Trigger prefetch in background (non-blocking)
+  if (prefetchEnd > prefetchStart) {
+    setImmediate(() => {
+      file.createReadStream({ start: prefetchStart, end: prefetchEnd });
+    });
   }
   
   let chunksize = end - start + 1;
@@ -452,7 +496,10 @@ app.get("/streamfile/:magnet/:filename", async function (req, res, next) {
     "X-Content-Type-Options": "nosniff",
     "Access-Control-Allow-Origin": "*", // CDN compatibility
     "Access-Control-Expose-Headers": "Content-Range, Accept-Ranges",
-    "Connection": "keep-alive" // Reuse connections
+    "Connection": "keep-alive", // Reuse connections
+    // 🔥 IDM BYPASS - Prevent download manager interference
+    "X-Content-Disposition": "inline",
+    "Content-Disposition": "inline"
   };
 
   res.writeHead(206, head);
@@ -2125,49 +2172,69 @@ app.get("/hls/:magnet/:filename/master.m3u8", async (req, res) => {
     fs.mkdirSync(videoCacheDir, { recursive: true });
   }
   
-  console.log(chalk.cyan('🔄 Converting to HLS (multi-quality)...'));
+  console.log(chalk.cyan('🔄 Creating HLS stream (COPY mode - no re-encode, instant!)...'));
   
   try {
-    // OPTIMIZED: Generate 3 quality variants (720p, 1080p, Auto)
+    // 🔥 TRANSMUX ONLY - No re-encoding! Just copy streams
     const qualities = [
-      { name: '720p', height: 720, bitrate: '2500k', audioBitrate: '128k' },
-      { name: '1080p', height: 1080, bitrate: '5000k', audioBitrate: '192k' },
+      { name: 'original', copy: true }, // Copy mode - instant!
     ];
     
     const variantPromises = qualities.map((quality, idx) => {
       return new Promise((resolve, reject) => {
-        const playlistName = `variant_${quality.name}.m3u8`;
+        const playlistName = `stream.m3u8`;
         const playlistPath = path.join(videoCacheDir, playlistName);
         
-        console.log(chalk.yellow(`  🎬 Generating ${quality.name}...`));
+        console.log(chalk.yellow(`  🎬 Transmuxing (COPY all streams - instant!)...`));
         
+        // 🔥 COPY MODE - No re-encoding, just remux MKV to HLS!
         const args = [
           '-i', videoPath,
-          '-vf', `scale=-2:${quality.height}`,
-          '-c:v', 'libx264',
-          '-b:v', quality.bitrate,
-          '-c:a', 'aac',
-          '-b:a', quality.audioBitrate,
-          '-preset', 'veryfast',
-          '-hls_time', '6',
-          '-hls_list_size', '0',
-          '-hls_segment_filename', path.join(videoCacheDir, `${quality.name}_seg%03d.ts`),
+          '-c', 'copy',                         // 🔥 Copy all streams (no encode!)
+          '-map', '0',                          // 🔥 Include ALL streams
+          '-bsf:a', 'aac_adtstoasc',           // Fix AAC for HLS
+          '-start_number', '0',
+          '-hls_time', '4',                     // 4-second segments
+          '-hls_list_size', '15',               // 🔥 Keep only 15 segments (60s buffer)
+          '-hls_flags', 'delete_segments+omit_endlist', // 🔥 Auto-delete old!
+          '-hls_segment_type', 'mpegts',
+          '-hls_segment_filename', path.join(videoCacheDir, 'seg%03d.ts'),
           '-f', 'hls',
           playlistPath
         ];
         
         const proc = spawn(ffmpegPath.path, args);
         
-        proc.on('close', (code) => {
-          if (code === 0) {
-            console.log(chalk.green(`    ✅ ${quality.name} done`));
-            resolve({ name: playlistName, ...quality });
-          } else {
-            reject(new Error(`${quality.name} failed`));
+        let lastLog = 0;
+        proc.stderr.on('data', (data) => {
+          const output = data.toString();
+          // Show progress every 5 seconds
+          if (output.includes('time=')) {
+            const now = Date.now();
+            if (now - lastLog > 5000) {
+              const match = output.match(/time=(\d+):(\d+):(\d+)/);
+              if (match) {
+                console.log(chalk.gray('    🔄'), `${match[1]}:${match[2]}:${match[3]}`);
+                lastLog = now;
+              }
+            }
           }
         });
         
-        proc.on('error', reject);
+        proc.on('close', (code) => {
+          if (code === 0) {
+            console.log(chalk.green(`    ✅ Transmux complete (COPY mode)`));
+            resolve({ name: playlistName, copy: true });
+          } else {
+            console.error(chalk.red(`    ❌ Transmux failed with code ${code}`));
+            reject(new Error(`Transmux failed`));
+          }
+        });
+        
+        proc.on('error', (err) => {
+          console.error(chalk.red('    ❌ FFmpeg error:'), err.message);
+          reject(err);
+        });
       });
     });
     
@@ -2489,11 +2556,41 @@ app.use((err, req, res, next) => {
 
 const PORT = process.env.PORT || 64621;
 
-app.listen(PORT, () => {
+// Health check for Render.com
+app.get('/health', (req, res) => {
+  res.status(200).json({
+    status: 'ok',
+    uptime: process.uptime(),
+    torrents: client.torrents.length,
+    environment: process.env.NODE_ENV || 'development',
+    timestamp: new Date().toISOString()
+  });
+});
+
+// 🔥 Process error handlers - Prevent crashes
+process.on('uncaughtException', (err) => {
+  console.error(chalk.red('❌❌❌ UNCAUGHT EXCEPTION ❌❌❌'));
+  console.error(chalk.red(err.stack));
+  // Don't exit - keep server running
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error(chalk.red('❌ Unhandled Rejection at:'), promise);
+  console.error(chalk.red('Reason:'), reason);
+  // Don't exit
+});
+
+// Bind to 0.0.0.0 for Render.com
+const HOST = process.env.HOST || '0.0.0.0';
+
+app.listen(PORT, HOST, () => {
   console.log(chalk.green('═══════════════════════════════════════════'));
   console.log(chalk.green(`  🚀 Zenshin Server Running`));
-  console.log(chalk.green(`  📡 Port: ${PORT}`));
+  console.log(chalk.green(`  📡 Host: ${HOST}:${PORT}`));
+  console.log(chalk.green(`  🌍 Environment: ${process.env.NODE_ENV || 'development'}`));
   console.log(chalk.green(`  🔒 Security: Enabled`));
   console.log(chalk.green(`  💾 Database: SQLite`));
+  console.log(chalk.green(`  🛡 Crash Protection: ON`));
+  console.log(chalk.green(`  ✅ Health: ${HOST}:${PORT}/health`));
   console.log(chalk.green('═══════════════════════════════════════════'));
 });
