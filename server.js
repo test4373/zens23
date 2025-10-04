@@ -330,23 +330,29 @@ app.get("/add/:magnet", async (req, res) => {
   console.log("Existing torrent:", existingTorrent);
 
   if (existingTorrent) {
+    // 🚀 INSTANT: Start downloading ALL files immediately for cache
+    existingTorrent.files.forEach(f => f.select());
+    console.log(chalk.cyan('🚀 Background download accelerated for all files'));
+    
     // If torrent is already added, return its file information
     let files = existingTorrent.files.map((file) => ({
       name: file.name,
       length: file.length,
     }));
-    // console.log("Existing torrent files:", files);
 
     return res.status(200).json(files);
   }
   /* ------------------------------------------------------ */
 
-  client.add(magnet, function (torrent) {
+  client.add(magnet, { path: downloadsDir }, function (torrent) {
+    // 🚀 AGGRESSIVE: Start downloading immediately
+    torrent.files.forEach(f => f.select());
+    console.log(chalk.green('📥 Aggressive download started for instant caching'));
+    
     let files = torrent.files.map((file) => ({
       name: file.name,
       length: file.length,
     }));
-    // console.log(files);
 
     res.status(200).json(files);
   });
@@ -447,8 +453,20 @@ app.get("/streamfile/:magnet/:filename", async function (req, res, next) {
   let tor = await client.get(magnet);
 
   if (!tor) {
-    console.log(chalk.red('❌ Torrent not found'));
-    return res.status(404).send("Torrent not found");
+    console.log(chalk.red('❌ Torrent not found - adding now...'));
+    // 🚀 AUTO-ADD: If torrent not found, add it immediately!
+    try {
+      tor = await new Promise((resolve, reject) => {
+        const newTor = client.add(magnet, { path: downloadsDir });
+        newTor.on('metadata', () => resolve(newTor));
+        newTor.on('error', reject);
+        setTimeout(() => reject(new Error('Timeout')), 10000);
+      });
+      console.log(chalk.green('✅ Torrent added on-the-fly'));
+    } catch (err) {
+      console.log(chalk.red('❌ Failed to add torrent:', err.message));
+      return res.status(404).send("Torrent not found");
+    }
   }
 
   let file = tor.files.find((f) => f.name === filename);
@@ -493,11 +511,11 @@ app.get("/streamfile/:magnet/:filename", async function (req, res, next) {
   // 🔥 FIX: Support both range and non-range requests
   if (!range) {
     // No range header - send first chunk as partial content to trigger range requests
-    console.log(chalk.yellow('⚡ No range header - sending initial partial content'));
+    console.log(chalk.yellow('⚡ No range header - sending LARGE initial chunk'));
     
-    // Send first 1MB as partial content to kickstart video.js
+    // 🚀 ULTRA FAST: Send first 5MB for instant playback!
     const start = 0;
-    const end = Math.min(1024 * 1024, file_size - 1); // 1MB or file size
+    const end = Math.min(5 * 1024 * 1024, file_size - 1); // 5MB for smooth start
     const chunksize = end - start + 1;
     
     const head = {
@@ -533,20 +551,21 @@ app.get("/streamfile/:magnet/:filename", async function (req, res, next) {
   let start = parseInt(positions[0], 10);
   let end = positions[1] ? parseInt(positions[1], 10) : file_size - 1;
   
-  // 🔥 LARGE CHUNK SIZE - Download bigger chunks for smooth playback
-  const MAX_CHUNK = 10 * 1024 * 1024; // 10MB chunks (no stuttering!)
+  // 🔥 ULTRA LARGE CHUNK SIZE - Maximum smooth playback
+  const MAX_CHUNK = 20 * 1024 * 1024; // 20MB chunks (ultra smooth!)
   if (end - start > MAX_CHUNK) {
     end = start + MAX_CHUNK;
   }
   
-  // 🚀 SMART PREFETCH - Download ahead for buffer
+  // 🚀 AGGRESSIVE PREFETCH - Download way ahead for zero buffering
   const prefetchStart = end + 1;
-  const prefetchEnd = Math.min(prefetchStart + (5 * 1024 * 1024), file_size); // 5MB prefetch
+  const prefetchEnd = Math.min(prefetchStart + (10 * 1024 * 1024), file_size); // 10MB prefetch!
   
   // Trigger prefetch in background (non-blocking)
   if (prefetchEnd > prefetchStart) {
     setImmediate(() => {
       file.createReadStream({ start: prefetchStart, end: prefetchEnd });
+      console.log(chalk.cyan('🔮 Prefetching next 10MB...'));
     });
   }
   
@@ -561,15 +580,17 @@ app.get("/streamfile/:magnet/:filename", async function (req, res, next) {
     "Accept-Ranges": "bytes",
     "Content-Length": chunksize,
     "Content-Type": "video/x-matroska",
-    // 🚀 AGGRESSIVE CACHING for ultra-fast playback!
-    "Cache-Control": "public, max-age=86400, immutable", // 24 hour cache
+    // 🚀 ULTRA AGGRESSIVE CACHING
+    "Cache-Control": "public, max-age=31536000, immutable", // 1 YEAR!
     "X-Content-Type-Options": "nosniff",
-    "Access-Control-Allow-Origin": "*", // CDN compatibility
+    "Access-Control-Allow-Origin": "*",
     "Access-Control-Expose-Headers": "Content-Range, Accept-Ranges",
-    "Connection": "keep-alive", // Reuse connections
-    // 🔥 IDM BYPASS - Prevent download manager interference
+    "Connection": "keep-alive",
+    // 🔥 INSTANT PLAYBACK HINTS
     "X-Content-Disposition": "inline",
-    "Content-Disposition": "inline"
+    "Content-Disposition": "inline",
+    "X-Accel-Buffering": "no", // Disable nginx buffering
+    "Transfer-Encoding": "chunked" // Stream immediately
   };
 
   res.writeHead(206, head);
