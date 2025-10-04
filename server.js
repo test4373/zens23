@@ -1479,8 +1479,23 @@ app.get("/subtitle/:magnet/:filename/:trackId", async (req, res) => {
   }
 });
 
+// 💾 Subtitle cache - Store extracted subtitles in memory
+const subtitleCache = new Map();
+
 // Get subtitle for a specific file (extract from MKV if needed) - DEFAULT TRACK
 app.get("/subtitles/:magnet/:filename", async (req, res) => {
+  const cacheKey = `${req.params.magnet}_${req.params.filename}`;
+  
+  // 🔥 CHECK CACHE FIRST
+  if (subtitleCache.has(cacheKey)) {
+    console.log(chalk.green('⚡ SUBTITLE CACHE HIT - Instant delivery!'));
+    const cached = subtitleCache.get(cacheKey);
+    res.setHeader("Content-Type", "text/vtt");
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Expose-Headers", "X-Subtitle-Type");
+    res.setHeader("X-Subtitle-Type", cached.type);
+    return res.send(cached.content);
+  }
   let magnet = req.params.magnet;
   let filename = req.params.filename;
 
@@ -1540,11 +1555,26 @@ app.get("/subtitles/:magnet/:filename", async (req, res) => {
     res.setHeader("Content-Type", "text/vtt");
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Expose-Headers", "X-Subtitle-Type");
-    res.setHeader("X-Subtitle-Type", isAssFile ? "ass" : "srt");
-    console.log(chalk.green('🏷️ Subtitle type header set:'), isAssFile ? 'ASS' : 'SRT');
-    
-    let stream = subtitleFile.createReadStream();
-    stream.pipe(res);
+          res.setHeader("X-Subtitle-Type", isAssFile ? "ass" : "srt");
+      console.log(chalk.green('🏷️ Subtitle type header set:'), isAssFile ? 'ASS' : 'SRT');
+      
+      // 💾 Cache the subtitle for instant future access
+      let subtitleContent = '';
+      let stream = subtitleFile.createReadStream();
+      
+      stream.on('data', (chunk) => {
+        subtitleContent += chunk.toString();
+      });
+      
+      stream.on('end', () => {
+        subtitleCache.set(cacheKey, {
+          content: subtitleContent,
+          type: isAssFile ? 'ass' : 'srt'
+        });
+        console.log(chalk.cyan('💾 Subtitle cached for instant future access'));
+      });
+      
+      stream.pipe(res);
 
     stream.on("error", function (err) {
       console.error(chalk.red("Subtitle stream error:"), err);
