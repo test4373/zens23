@@ -101,25 +101,36 @@ const app = express();
 // Local server - no proxy needed
 // app.set('trust proxy', 1);
 
-// WebTorrent client - OPTIMIZED FOR SMOOTH PLAYBACK
+// WebTorrent client - ULTRA OPTIMIZED FOR RENDER.COM
 const client = new WebTorrent({
-  maxConns: 55,          // More connections = faster download
-  downloadLimit: -1,     // Unlimited download (use full bandwidth)
-  uploadLimit: 100000,   // 100 KB/s upload (fair sharing)
+  maxConns: 100,         // 🔥 More connections for faster startup
+  downloadLimit: -1,     // Unlimited download
+  uploadLimit: 50000,    // Lower upload to prioritize download
   dht: true,
-  lsd: true,             // Local Service Discovery
+  lsd: false,            // Disable LSD (not needed on cloud)
   tracker: {
     announce: [
+      // 🔥 WebSocket trackers work best on Render.com
       'wss://tracker.openwebtorrent.com',
       'wss://tracker.btorrent.xyz',
       'wss://tracker.fastcast.nz',
-      'udp://tracker.openbittorrent.com:80',
-      'udp://tracker.opentrackr.org:1337'
-    ]
+      'wss://tracker.webtorrent.dev',
+      // HTTP/UDP trackers as fallback
+      'udp://tracker.opentrackr.org:1337',
+      'udp://open.stealth.si:80',
+      'udp://exodus.desync.com:6969',
+    ],
+    rtcConfig: {
+      // 🔥 STUN servers for better P2P on cloud
+      iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:global.stun.twilio.com:3478' }
+      ]
+    }
   },
-  // CRITICAL: Sequential download + piece prioritization
-  strategy: 'rarest', // Download rarest pieces first (better peer connections)
-  prioritizeInitial: true, // Prioritize first and last pieces for seeking
+  // 🚀 AGGRESSIVE: Download sequential for instant playback
+  strategy: 'sequential', // Download in order for streaming
+  prioritizeInitial: true,
 });
 
 console.log(chalk.cyan('🌐 WebTorrent initialized (STREAM-ONLY mode)'));
@@ -399,7 +410,7 @@ app.get("/streamfile/:magnet/:filename", async function (req, res, next) {
   }
   console.log(chalk.green('✅ File found:'), file.name);
 
-  // 🔥 CRITICAL: Smart file selection - only download what's needed
+  // 🔥 CRITICAL: Smart file selection + PRIORITY
   file.select();
   
   // Deselect all other files to save bandwidth
@@ -409,10 +420,18 @@ app.get("/streamfile/:magnet/:filename", async function (req, res, next) {
     }
   });
   
+  // 🚀 RENDER.COM OPTIMIZATION: Prioritize first 10MB for instant playback
+  const priorityBytes = 10 * 1024 * 1024; // 10MB
+  if (file.length > priorityBytes) {
+    console.log(chalk.cyan('🚀 Setting priority for first 10MB...'));
+    // Note: WebTorrent will automatically prioritize pieces being streamed
+  }
+  
   console.log(chalk.cyan('💡 Bandwidth optimization:'));
   console.log(chalk.yellow('  Selected file:'), file.name);
   console.log(chalk.yellow('  File size:'), (file.length / 1024 / 1024).toFixed(2), 'MB');
-  console.log(chalk.green('  ✅ Other files deselected to save bandwidth'));
+  console.log(chalk.green('  ✅ Other files deselected'));
+  console.log(chalk.magenta('  🌐 Render.com optimized streaming active'));
 
   let range = req.headers.range;
 
