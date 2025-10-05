@@ -404,6 +404,10 @@ app.get("/metadata/:magnet", async (req, res) => {
   });
 });
 
+// 🔥 VIDEO CHUNK SIZE: Optimize for instant playback
+const OPTIMAL_VIDEO_CHUNK = 2 * 1024 * 1024; // 2MB - Perfect for instant start
+const PREFETCH_SIZE = 5 * 1024 * 1024; // 5MB prefetch
+
 app.get("/streamfile/:magnet/:filename", async function (req, res, next) {
   let magnet = req.params.magnet;
   let filename = decodeURIComponent(req.params.filename);
@@ -508,14 +512,14 @@ app.get("/streamfile/:magnet/:filename", async function (req, res, next) {
 
   let file_size = file.length;
 
-  // 🔥 FIX: Support both range and non-range requests
+  // 🔥 OPTIMIZED: Support both range and non-range requests
   if (!range) {
-    // No range header - send first chunk as partial content to trigger range requests
-    console.log(chalk.yellow('⚡ No range header - sending LARGE initial chunk'));
+    // No range header - send OPTIMAL first chunk for instant playback
+    console.log(chalk.yellow('⚡ No range - sending optimal 2MB chunk'));
     
-    // 🚀 ULTRA FAST: Send first 5MB for instant playback!
+    // 🚀 2MB = Perfect balance: Instant start + smooth playback
     const start = 0;
-    const end = Math.min(5 * 1024 * 1024, file_size - 1); // 5MB for smooth start
+    const end = Math.min(OPTIMAL_VIDEO_CHUNK, file_size - 1);
     const chunksize = end - start + 1;
     
     const head = {
@@ -551,15 +555,15 @@ app.get("/streamfile/:magnet/:filename", async function (req, res, next) {
   let start = parseInt(positions[0], 10);
   let end = positions[1] ? parseInt(positions[1], 10) : file_size - 1;
   
-  // 🔥 ULTRA LARGE CHUNK SIZE - Maximum smooth playback
-  const MAX_CHUNK = 20 * 1024 * 1024; // 20MB chunks (ultra smooth!)
+  // 🔥 SMART CHUNK SIZE - Balance speed & memory
+  const MAX_CHUNK = 5 * 1024 * 1024; // 5MB chunks (optimal!)
   if (end - start > MAX_CHUNK) {
     end = start + MAX_CHUNK;
   }
   
-  // 🚀 AGGRESSIVE PREFETCH - Download way ahead for zero buffering
+  // 🚀 SMART PREFETCH - Just enough ahead for smooth playback
   const prefetchStart = end + 1;
-  const prefetchEnd = Math.min(prefetchStart + (10 * 1024 * 1024), file_size); // 10MB prefetch!
+  const prefetchEnd = Math.min(prefetchStart + PREFETCH_SIZE, file_size);
   
   // Trigger prefetch in background (non-blocking)
   if (prefetchEnd > prefetchStart) {
@@ -1500,14 +1504,45 @@ app.get("/subtitle/:magnet/:filename/:trackId", async (req, res) => {
   }
 });
 
-// 💾 Subtitle cache - Store extracted subtitles in memory
-const subtitleCache = new Map();
+// 💾 Subtitle cache - Store extracted subtitles in memory with LRU eviction
+class SubtitleCache {
+  constructor(maxSize = 50) {
+    this.cache = new Map();
+    this.maxSize = maxSize;
+  }
+  
+  get(key) {
+    const item = this.cache.get(key);
+    if (item) {
+      // Move to end (most recently used)
+      this.cache.delete(key);
+      this.cache.set(key, item);
+    }
+    return item;
+  }
+  
+  set(key, value) {
+    // Remove oldest if at capacity
+    if (this.cache.size >= this.maxSize) {
+      const firstKey = this.cache.keys().next().value;
+      this.cache.delete(firstKey);
+      console.log(chalk.gray('🗑️ Evicted old subtitle from cache'));
+    }
+    this.cache.set(key, value);
+  }
+  
+  has(key) {
+    return this.cache.has(key);
+  }
+}
+
+const subtitleCache = new SubtitleCache(50);
 
 // Get subtitle for a specific file (extract from MKV if needed) - DEFAULT TRACK
 app.get("/subtitles/:magnet/:filename", async (req, res) => {
   const cacheKey = `${req.params.magnet}_${req.params.filename}`;
   
-  // 🔥 CHECK CACHE FIRST
+  // 🔥 CHECK CACHE FIRST - Instant delivery!
   if (subtitleCache.has(cacheKey)) {
     console.log(chalk.green('⚡ SUBTITLE CACHE HIT - Instant delivery!'));
     const cached = subtitleCache.get(cacheKey);
@@ -1515,6 +1550,7 @@ app.get("/subtitles/:magnet/:filename", async (req, res) => {
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Expose-Headers", "X-Subtitle-Type");
     res.setHeader("X-Subtitle-Type", cached.type);
+    res.setHeader("Cache-Control", "public, max-age=86400, immutable"); // 1 day cache
     return res.send(cached.content);
   }
   let magnet = req.params.magnet;
@@ -1579,23 +1615,33 @@ app.get("/subtitles/:magnet/:filename", async (req, res) => {
           res.setHeader("X-Subtitle-Type", isAssFile ? "ass" : "srt");
       console.log(chalk.green('🏷️ Subtitle type header set:'), isAssFile ? 'ASS' : 'SRT');
       
-      // 💾 Cache the subtitle for instant future access
+      // 💾 SMART CACHE: Stream to client AND cache simultaneously
       let subtitleContent = '';
+      const chunks = [];
       let stream = subtitleFile.createReadStream();
       
       stream.on('data', (chunk) => {
-        subtitleContent += chunk.toString();
+        chunks.push(chunk);
+        res.write(chunk); // Stream to client immediately
       });
       
       stream.on('end', () => {
+        // Cache after streaming complete
+        subtitleContent = Buffer.concat(chunks).toString();
         subtitleCache.set(cacheKey, {
           content: subtitleContent,
           type: isAssFile ? 'ass' : 'srt'
         });
         console.log(chalk.cyan('💾 Subtitle cached for instant future access'));
+        res.end();
       });
       
-      stream.pipe(res);
+      stream.on('error', (err) => {
+        console.error(chalk.red('Subtitle stream error:'), err);
+        if (!res.headersSent) {
+          res.status(500).send('Error streaming subtitle');
+        }
+      });
 
     stream.on("error", function (err) {
       console.error(chalk.red("Subtitle stream error:"), err);
@@ -1867,14 +1913,22 @@ app.get("/subtitles/:magnet/:filename", async (req, res) => {
     if (fs.existsSync(subtitleOutputPath)) {
       console.log(chalk.green('✅ Subtitle extracted successfully'));
       
-      // Convert SRT to WebVTT
+      // Convert SRT to WebVTT AND cache it
       const srtContent = fs.readFileSync(subtitleOutputPath, 'utf-8');
       const vttContent = convertSRTtoVTT(srtContent);
+      
+      // 💾 Cache the extracted subtitle
+      subtitleCache.set(cacheKey, {
+        content: vttContent,
+        type: isAssSubtitle ? 'ass' : 'srt'
+      });
+      console.log(chalk.cyan('💾 MKV subtitle cached'));
       
       res.setHeader("Content-Type", "text/vtt");
       res.setHeader("Access-Control-Allow-Origin", "*");
       res.setHeader("Access-Control-Expose-Headers", "X-Subtitle-Type");
       res.setHeader("X-Subtitle-Type", isAssSubtitle ? "ass" : "srt");
+      res.setHeader("Cache-Control", "public, max-age=86400, immutable"); // 1 day cache
       console.log(chalk.green('🏷️ MKV Subtitle type header set:'), isAssSubtitle ? 'ASS' : 'SRT');
       res.send(vttContent);
       
