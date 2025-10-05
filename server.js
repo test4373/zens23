@@ -404,9 +404,10 @@ app.get("/metadata/:magnet", async (req, res) => {
   });
 });
 
-// 🔥 VIDEO CHUNK SIZE: Optimize for instant playback
-const OPTIMAL_VIDEO_CHUNK = 2 * 1024 * 1024; // 2MB - Perfect for instant start
-const PREFETCH_SIZE = 5 * 1024 * 1024; // 5MB prefetch
+// 🔥 VIDEO CHUNK SIZE: Optimize for smooth playback without freezing
+const OPTIMAL_VIDEO_CHUNK = 512 * 1024; // 512KB - Smaller chunks for smoother streaming
+const PREFETCH_SIZE = 2 * 1024 * 1024; // 2MB prefetch
+const MAX_CHUNK = 1 * 1024 * 1024; // 1MB max chunk size
 
 app.get("/streamfile/:magnet/:filename", async function (req, res, next) {
   let magnet = req.params.magnet;
@@ -514,10 +515,10 @@ app.get("/streamfile/:magnet/:filename", async function (req, res, next) {
 
   // 🔥 OPTIMIZED: Support both range and non-range requests
   if (!range) {
-    // No range header - send OPTIMAL first chunk for instant playback
-    console.log(chalk.yellow('⚡ No range - sending optimal 2MB chunk'));
+    // No range header - send small initial chunk for instant playback
+    console.log(chalk.yellow('⚡ No range - sending optimal 512KB chunk'));
     
-    // 🚀 2MB = Perfect balance: Instant start + smooth playback
+    // 🚀 512KB = Instant start without freezing
     const start = 0;
     const end = Math.min(OPTIMAL_VIDEO_CHUNK, file_size - 1);
     const chunksize = end - start + 1;
@@ -527,7 +528,7 @@ app.get("/streamfile/:magnet/:filename", async function (req, res, next) {
       "Accept-Ranges": "bytes",
       "Content-Length": chunksize,
       "Content-Type": "video/x-matroska",
-      "Cache-Control": "public, max-age=86400, immutable",
+      "Cache-Control": "public, max-age=3600",
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Expose-Headers": "Content-Range, Accept-Ranges",
       "Connection": "keep-alive",
@@ -555,21 +556,22 @@ app.get("/streamfile/:magnet/:filename", async function (req, res, next) {
   let start = parseInt(positions[0], 10);
   let end = positions[1] ? parseInt(positions[1], 10) : file_size - 1;
   
-  // 🔥 SMART CHUNK SIZE - Balance speed & memory
-  const MAX_CHUNK = 5 * 1024 * 1024; // 5MB chunks (optimal!)
+  // 🔥 SMART CHUNK SIZE - Smaller chunks to prevent freezing
   if (end - start > MAX_CHUNK) {
-    end = start + MAX_CHUNK;
+    end = start + MAX_CHUNK - 1;
   }
   
-  // 🚀 SMART PREFETCH - Just enough ahead for smooth playback
+  // 🚀 SMART PREFETCH - Just enough ahead for smooth playback (reduced)
   const prefetchStart = end + 1;
-  const prefetchEnd = Math.min(prefetchStart + PREFETCH_SIZE, file_size);
+  const prefetchEnd = Math.min(prefetchStart + PREFETCH_SIZE, file_size - 1);
   
-  // Trigger prefetch in background (non-blocking)
-  if (prefetchEnd > prefetchStart) {
+  // Trigger prefetch in background (non-blocking) - less aggressive
+  if (prefetchEnd > prefetchStart && Math.random() < 0.5) { // 50% chance to prefetch
     setImmediate(() => {
-      file.createReadStream({ start: prefetchStart, end: prefetchEnd });
-      console.log(chalk.cyan('🔮 Prefetching next 10MB...'));
+      const prefetchStream = file.createReadStream({ start: prefetchStart, end: prefetchEnd });
+      prefetchStream.on('data', () => {}); // Consume data
+      prefetchStream.on('error', () => {}); // Ignore errors
+      console.log(chalk.cyan('🔮 Prefetching next 2MB...'));
     });
   }
   
@@ -584,17 +586,15 @@ app.get("/streamfile/:magnet/:filename", async function (req, res, next) {
     "Accept-Ranges": "bytes",
     "Content-Length": chunksize,
     "Content-Type": "video/x-matroska",
-    // 🚀 ULTRA AGGRESSIVE CACHING
-    "Cache-Control": "public, max-age=31536000, immutable", // 1 YEAR!
+    // 🚀 MODERATE CACHING - Prevent freezing
+    "Cache-Control": "public, max-age=3600", // 1 hour
     "X-Content-Type-Options": "nosniff",
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Expose-Headers": "Content-Range, Accept-Ranges",
     "Connection": "keep-alive",
-    // 🔥 INSTANT PLAYBACK HINTS
+    // 🔥 SMOOTH PLAYBACK HINTS
     "X-Content-Disposition": "inline",
-    "Content-Disposition": "inline",
-    "X-Accel-Buffering": "no", // Disable nginx buffering
-    "Transfer-Encoding": "chunked" // Stream immediately
+    "Content-Disposition": "inline"
   };
 
   res.writeHead(206, head);
