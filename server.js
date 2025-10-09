@@ -101,22 +101,20 @@ const app = express();
 // Local server - no proxy needed
 // app.set('trust proxy', 1);
 
-// WebTorrent client - RAILWAY OPTIMIZED (Low Memory)
+// WebTorrent client - KOYEB OPTIMIZED (Ultra Low Memory)
 const client = new WebTorrent({
-  maxConns: 20,          // 🔥 REDUCED: Fewer connections to prevent memory issues
+  maxConns: 10,          // 🔥 KOYEB: Reduced to 10 for RAM savings
   downloadLimit: -1,     // Unlimited download
-  uploadLimit: 10000,    // Very low upload to save bandwidth
-  dht: false,            // ❌ DISABLED: DHT uses too much memory on Railway
+  uploadLimit: 5000,     // 🔥 KOYEB: Reduced to 5KB/s to save RAM
+  dht: false,            // ❌ DISABLED: DHT uses too much memory
   lsd: false,            // Disable LSD (not needed on cloud)
   tracker: {
     announce: [
-      // Only reliable HTTP trackers (WebSocket can cause crashes)
       'udp://tracker.opentrackr.org:1337',
       'udp://open.stealth.si:80',
     ],
     rtcConfig: null        // ❌ DISABLED: WebRTC can cause SIGSEGV on low memory
   },
-  // 🚀 Sequential download for streaming
   strategy: 'sequential',
   prioritizeInitial: true,
 });
@@ -1533,7 +1531,7 @@ class SubtitleCache {
   }
 }
 
-const subtitleCache = new SubtitleCache(50);
+const subtitleCache = new SubtitleCache(20); // 🔥 KOYEB: Reduced to 20 for RAM savings
 
 // Get subtitle for a specific file (extract from MKV if needed) - DEFAULT TRACK
 app.get("/subtitles/:magnet/:filename", async (req, res) => {
