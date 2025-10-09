@@ -30,15 +30,15 @@ if (!fs.existsSync(downloadsDir)) {
   fs.mkdirSync(downloadsDir, { recursive: true });
 }
 
-// Upscale Tests directory
-const upscaleDir = path.join(path.dirname(__dirname), "Upscale Tests");
+// Upscale Tests directory - Use app directory in production
+const upscaleDir = path.join(__dirname, "upscale_tests");
 if (!fs.existsSync(upscaleDir)) {
   fs.mkdirSync(upscaleDir, { recursive: true });
 }
 console.log(chalk.cyan('📁 Upscale directory:'), upscaleDir);
 
-// LOCAL SUBTITLES directory (Dandadan Season 2)
-const localSubsDir = 'C:\\Users\\Yusuf\\Downloads\\Compressed\\[DB] Dandadan 2nd Season - Dan Da Dan Season 2 [Dual Audio 10bit 1080p][HEVC-x265]_attachments';
+// LOCAL SUBTITLES directory (Dandadan Season 2) - Only for local development
+const localSubsDir = process.env.LOCAL_SUBS_DIR || path.join(__dirname, "local_subs");
 
 // Recursive function to list all subtitle files
 function listSubtitlesRecursive(dir, depth = 0) {
