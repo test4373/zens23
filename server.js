@@ -2476,8 +2476,8 @@ app.get("/hls/:magnet/:filename/master.m3u8", async (req, res) => {
       });
     });
     
-    const audioStreams = streamInfo.streams.filter(s => s.codec_type === 'audio');
-    const subtitleStreams = streamInfo.streams.filter(s => s.codec_type === 'subtitle');
+    const audioStreams = metadata.streams.filter(s => s.codec_type === 'audio');
+    const subtitleStreams = metadata.streams.filter(s => s.codec_type === 'subtitle');
     
     console.log(chalk.cyan('📊 Stream Analysis:'));
     console.log(chalk.yellow('  Audio streams:'), audioStreams.length);
