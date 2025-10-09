@@ -101,35 +101,23 @@ const app = express();
 // Local server - no proxy needed
 // app.set('trust proxy', 1);
 
-// WebTorrent client - ULTRA OPTIMIZED FOR RENDER.COM
+// WebTorrent client - RAILWAY OPTIMIZED (Low Memory)
 const client = new WebTorrent({
-  maxConns: 100,         // 🔥 More connections for faster startup
+  maxConns: 20,          // 🔥 REDUCED: Fewer connections to prevent memory issues
   downloadLimit: -1,     // Unlimited download
-  uploadLimit: 50000,    // Lower upload to prioritize download
-  dht: true,
+  uploadLimit: 10000,    // Very low upload to save bandwidth
+  dht: false,            // ❌ DISABLED: DHT uses too much memory on Railway
   lsd: false,            // Disable LSD (not needed on cloud)
   tracker: {
     announce: [
-      // 🔥 WebSocket trackers work best on Render.com
-      'wss://tracker.openwebtorrent.com',
-      'wss://tracker.btorrent.xyz',
-      'wss://tracker.fastcast.nz',
-      'wss://tracker.webtorrent.dev',
-      // HTTP/UDP trackers as fallback
+      // Only reliable HTTP trackers (WebSocket can cause crashes)
       'udp://tracker.opentrackr.org:1337',
       'udp://open.stealth.si:80',
-      'udp://exodus.desync.com:6969',
     ],
-    rtcConfig: {
-      // 🔥 STUN servers for better P2P on cloud
-      iceServers: [
-        { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:global.stun.twilio.com:3478' }
-      ]
-    }
+    rtcConfig: null        // ❌ DISABLED: WebRTC can cause SIGSEGV on low memory
   },
-  // 🚀 AGGRESSIVE: Download sequential for instant playback
-  strategy: 'sequential', // Download in order for streaming
+  // 🚀 Sequential download for streaming
+  strategy: 'sequential',
   prioritizeInitial: true,
 });
 
