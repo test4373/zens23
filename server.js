@@ -1838,112 +1838,56 @@ app.get("/subtitles/:magnet/:filename", async (req, res) => {
       console.log(chalk.yellow('⚠️ Could not detect subtitle format:'), err.message);
     }
 
-    // Extract subtitle using fluent-ffmpeg - TRACK 5 (ASS)
-    console.log(chalk.cyan('🎬 Extracting subtitle from MKV...'));
-    console.log(chalk.yellow('  Trying Track 5 (0:s:4) - ASS subtitle'));
+    // 🚀 DIREKT STREAM - FFmpeg extraction yok, çok daha hızlı!
+    console.log(chalk.cyan('🎬 Streaming subtitle directly from MKV (no extraction)...'));
     
-    // Try Track 5 first (index 4, because 0-indexed)
-    let extractSuccess = false;
+    res.setHeader("Content-Type", "text/vtt");
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Expose-Headers", "X-Subtitle-Type");
+    res.setHeader("X-Subtitle-Type", isAssSubtitle ? "ass" : "srt");
+    res.setHeader("Cache-Control", "public, max-age=86400, immutable");
     
-    try {
-      await new Promise((resolve, reject) => {
-        ffmpeg(videoPath)
+    // Direkt stream - Track 5'i dene, yoksa Track 0
+    const trackToTry = 4; // Track 5 (0-indexed)
+    
+    console.log(chalk.yellow(`  Trying Track ${trackToTry + 1} (0:s:${trackToTry})`));
+    
+    const subtitleStream = ffmpeg(videoPath)
+      .outputOptions([
+        `-map 0:s:${trackToTry}`,
+        '-f webvtt',  // Direkt WebVTT formatında
+        '-'           // stdout'a yaz
+      ])
+      .on('start', (cmd) => {
+        console.log(chalk.gray('  FFmpeg stream command:'), cmd);
+      })
+      .on('error', (err) => {
+        console.log(chalk.yellow(`  ⚠️ Track ${trackToTry + 1} failed, trying Track 1...`));
+        
+        // Fallback: Track 0
+        const fallbackStream = ffmpeg(videoPath)
           .outputOptions([
-            '-map 0:s:4',  // Track 5 (0-indexed = 4)
-            '-c:s srt',    // Convert to SRT
-            '-y'           // Overwrite
+            '-map 0:s:0',
+            '-f webvtt',
+            '-'
           ])
-        .output(subtitleOutputPath)
-        .on('start', (cmd) => {
-          console.log(chalk.gray('FFmpeg command:'), cmd);
-        })
-        .on('progress', (progress) => {
-          if (progress.percent) {
-            console.log(chalk.yellow(`🔄 Progress: ${progress.percent.toFixed(1)}%`));
-          }
-        })
-                  .on('end', () => {
-            console.log(chalk.green('✅ Track 5 extracted successfully!'));
-            extractSuccess = true;
-            resolve();
-          })
-          .on('error', (err) => {
-            console.log(chalk.yellow('⚠️ Track 5 not available:'), err.message);
-            reject(err);
-          })
-          .run();
-      });
-    } catch (track5Error) {
-      // Track 5 failed, try first available subtitle track
-      console.log(chalk.yellow('  Fallback: Trying first subtitle track (0:s:0)'));
-      
-      await new Promise((resolve, reject) => {
-        ffmpeg(videoPath)
-          .outputOptions([
-            '-map 0:s:0',  // First subtitle stream
-            '-c:s srt',    // Convert to SRT
-            '-y'           // Overwrite
-          ])
-          .output(subtitleOutputPath)
           .on('start', (cmd) => {
-            console.log(chalk.gray('FFmpeg fallback command:'), cmd);
+            console.log(chalk.gray('  Fallback command:'), cmd);
           })
-          .on('progress', (progress) => {
-            if (progress.percent) {
-              console.log(chalk.yellow(`🔄 Fallback progress: ${progress.percent.toFixed(1)}%`));
+          .on('error', (fallbackErr) => {
+            console.error(chalk.red('  ❌ No subtitle track found'));
+            if (!res.headersSent) {
+              res.status(404).send('No subtitle track found in MKV');
             }
-          })
-          .on('end', () => {
-            console.log(chalk.green('✅ Fallback extraction complete'));
-            extractSuccess = true;
-            resolve();
-          })
-          .on('error', (err) => {
-            console.error(chalk.red('❌ FFmpeg fallback error:'), err.message);
-            reject(err);
-          })
-          .run();
+          });
+        
+        fallbackStream.pipe(res);
+        console.log(chalk.green('✅ Subtitle streaming (fallback)'));
+        return;
       });
-    }
-
-    // Check if subtitle was extracted
-    if (fs.existsSync(subtitleOutputPath)) {
-      console.log(chalk.green('✅ Subtitle extracted successfully'));
-      
-      // Convert SRT to WebVTT AND cache it
-      const srtContent = fs.readFileSync(subtitleOutputPath, 'utf-8');
-      const vttContent = convertSRTtoVTT(srtContent);
-      
-      // 💾 Cache the extracted subtitle
-      subtitleCache.set(cacheKey, {
-        content: vttContent,
-        type: isAssSubtitle ? 'ass' : 'srt'
-      });
-      console.log(chalk.cyan('💾 MKV subtitle cached'));
-      
-      res.setHeader("Content-Type", "text/vtt");
-      res.setHeader("Access-Control-Allow-Origin", "*");
-      res.setHeader("Access-Control-Expose-Headers", "X-Subtitle-Type");
-      res.setHeader("X-Subtitle-Type", isAssSubtitle ? "ass" : "srt");
-      res.setHeader("Cache-Control", "public, max-age=86400, immutable"); // 1 day cache
-      console.log(chalk.green('🏷️ MKV Subtitle type header set:'), isAssSubtitle ? 'ASS' : 'SRT');
-      res.send(vttContent);
-      
-      // Clean up temp file after 5 minutes
-      setTimeout(() => {
-        try {
-          if (fs.existsSync(subtitleOutputPath)) {
-            fs.unlinkSync(subtitleOutputPath);
-            console.log(chalk.gray('🧹 Cleaned up temp subtitle'));
-          }
-        } catch (err) {
-          console.error(chalk.red('Error cleaning temp file:'), err);
-        }
-      }, 5 * 60 * 1000);
-    } else {
-      console.log(chalk.yellow('⚠️ No embedded subtitle found in MKV'));
-      return res.status(404).send("No subtitle track found in MKV");
-    }
+    
+    subtitleStream.pipe(res);
+    console.log(chalk.green('✅ Subtitle streaming directly from MKV'));
   } catch (error) {
     console.error(chalk.red('❌ FFmpeg error:'), error.message);
     return res.status(500).send("Error extracting subtitle from MKV");
