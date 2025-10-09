@@ -5,7 +5,6 @@
     "dev": "nodemon server.js",
     "prod": "NODE_ENV=production node server.js",
     "install-players": "node install-players.js",
-    "postinstall": "node install-players.js",
     "setup:oracle": "chmod +x oracle-install.sh && ./oracle-install.sh",
     "create-admin": "node scripts/createFirstAdmin.js",
     "make-admin": "node scripts/makeAdminByUsername.js",
