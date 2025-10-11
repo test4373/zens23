@@ -2301,16 +2301,17 @@ app.get("/hls/:magnet/:filename/master.m3u8", async (req, res) => {
         
         console.log(chalk.yellow(`  🎬 Transmuxing (COPY all streams - instant!)...`));
         
-        // 🔥 COPY MODE - No re-encoding, just remux MKV to HLS!
+        // 🔥 TRANSCODE MODE - Transcode audio to AAC for HLS compatibility
         const args = [
           '-i', videoPath,
-          '-c', 'copy',                         // 🔥 Copy all streams (no encode!)
-          '-map', '0',                          // 🔥 Include ALL streams
+          '-c:v', 'copy',                       // Copy video stream
+          '-c:a', 'aac',                        // Transcode audio to AAC
+          '-map', '0',                          // Include ALL streams
           '-bsf:a', 'aac_adtstoasc',           // Fix AAC for HLS
           '-start_number', '0',
           '-hls_time', '4',                     // 4-second segments
-          '-hls_list_size', '15',               // 🔥 Keep only 15 segments (60s buffer)
-          '-hls_flags', 'delete_segments+omit_endlist', // 🔥 Auto-delete old!
+          '-hls_list_size', '15',               // Keep only 15 segments (60s buffer)
+          '-hls_flags', 'delete_segments+omit_endlist', // Auto-delete old!
           '-hls_segment_type', 'mpegts',
           '-hls_segment_filename', path.join(videoCacheDir, 'seg%03d.ts'),
           '-f', 'hls',
