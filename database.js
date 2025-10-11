@@ -6,23 +6,74 @@ import chalk from 'chalk';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// SQLite database dosyasını oluştur - Render.com için /tmp kullan (yazılabilir)
-const dbPath = path.join(process.env.TMPDIR || process.env.TEMP || '/tmp', 'zenshin.db');
+// Database configuration - PostgreSQL for production, SQLite for development
+let db;
+let dbType = 'sqlite';
+
+if (process.env.DATABASE_URL) {
+  // Use PostgreSQL for production deployments
+  try {
+    const { Client } = await import('pg');
+    db = new Client({
+      connectionString: process.env.DATABASE_URL,
+      ssl: { rejectUnauthorized: false }
+    });
+    dbType = 'postgres';
+    console.log(chalk.blue('🔄 Using PostgreSQL database'));
+  } catch (error) {
+    console.error(chalk.red('PostgreSQL import error:'), error);
+    console.log(chalk.yellow('⚠️ Falling back to SQLite'));
+  }
+}
+
+if (!db) {
+  // SQLite fallback - use /tmp for deployments, current dir for local
+  const dbPath = process.env.NODE_ENV === 'production'
+    ? path.join(process.env.TMPDIR || process.env.TEMP || '/tmp', 'zenshin.db')
+    : path.join(__dirname, 'zenshin.db');
+
+  db = new sqlite3.Database(dbPath, (err) => {
+    if (err) {
+      console.error(chalk.red('SQLite database connection error:'), err);
+    } else {
+      console.log(chalk.green('✓ SQLite database connected successfully'));
+      initializeDatabase();
+    }
+  });
+  dbType = 'sqlite';
+}
 
 // Database bağlantısı
-const db = new sqlite3.Database(dbPath, (err) => {
-  if (err) {
-    console.error(chalk.red('Database connection error:'), err);
-  } else {
-    console.log(chalk.green('✓ Database connected successfully'));
-    initializeDatabase();
-  }
-});
+if (dbType === 'postgres') {
+  db.connect((err) => {
+    if (err) {
+      console.error(chalk.red('PostgreSQL connection error:'), err);
+    } else {
+      console.log(chalk.green('✓ PostgreSQL connected successfully'));
+      initializeDatabase();
+    }
+  });
+}
 
 // Database tablolarını oluştur
 function initializeDatabase() {
+  const isPostgres = dbType === 'postgres';
+
   // Kullanıcılar tablosu
-  db.run(`
+  const usersTableSQL = isPostgres ? `
+    CREATE TABLE IF NOT EXISTS users (
+      id SERIAL PRIMARY KEY,
+      username TEXT UNIQUE NOT NULL,
+      email TEXT UNIQUE NOT NULL,
+      password TEXT NOT NULL,
+      avatar TEXT DEFAULT '/zenshin/default-avatar.png',
+      bio TEXT DEFAULT '',
+      banner TEXT DEFAULT '',
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      last_login TIMESTAMP
+    )
+  ` : `
     CREATE TABLE IF NOT EXISTS users (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       username TEXT UNIQUE NOT NULL,
@@ -35,13 +86,42 @@ function initializeDatabase() {
       updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       last_login DATETIME
     )
-  `, (err) => {
-    if (err) console.error(chalk.red('Error creating users table:'), err);
-    else console.log(chalk.green('✓ Users table ready'));
-  });
+  `;
+
+  const runQuery = (sql, tableName) => {
+    if (isPostgres) {
+      db.query(sql, (err) => {
+        if (err) console.error(chalk.red(`Error creating ${tableName} table:`), err);
+        else console.log(chalk.green(`✓ ${tableName} table ready`));
+      });
+    } else {
+      db.run(sql, (err) => {
+        if (err) console.error(chalk.red(`Error creating ${tableName} table:`), err);
+        else console.log(chalk.green(`✓ ${tableName} table ready`));
+      });
+    }
+  };
+
+  runQuery(usersTableSQL, 'Users');
 
   // İzleme geçmişi tablosu
-  db.run(`
+  const watchHistoryTableSQL = isPostgres ? `
+    CREATE TABLE IF NOT EXISTS watch_history (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL,
+      anime_id TEXT NOT NULL,
+      anime_title TEXT NOT NULL,
+      anime_image TEXT,
+      episode_number INTEGER,
+      magnet_uri TEXT,
+      last_watched TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      progress REAL DEFAULT 0,
+      watch_time INTEGER DEFAULT 0,
+      status TEXT DEFAULT 'watching',
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+      UNIQUE(user_id, anime_id, episode_number, magnet_uri)
+    )
+  ` : `
     CREATE TABLE IF NOT EXISTS watch_history (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       user_id INTEGER NOT NULL,
@@ -57,51 +137,9 @@ function initializeDatabase() {
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
       UNIQUE(user_id, anime_id, episode_number, magnet_uri)
     )
-  `, (err) => {
-    if (err) console.error(chalk.red('Error creating watch_history table:'), err);
-    else {
-      console.log(chalk.green('✓ Watch history table ready'));
-      
-      // Add magnet_uri column if it doesn't exist (migration)
-      db.run(`ALTER TABLE watch_history ADD COLUMN magnet_uri TEXT`, (err) => {
-        if (err && !err.message.includes('duplicate column')) {
-          console.error(chalk.yellow('Note: magnet_uri column may already exist'));
-        }
-      });
-      
-      // Add watch_time column if it doesn't exist (migration)
-      db.run(`ALTER TABLE watch_history ADD COLUMN watch_time INTEGER DEFAULT 0`, (err) => {
-        if (err && !err.message.includes('duplicate column')) {
-          console.error(chalk.yellow('Note: watch_time column may already exist'));
-        }
-      });
-      
-      // Add current_time column for second-based progress (migration)
-      db.run(`ALTER TABLE watch_history ADD COLUMN current_time REAL DEFAULT 0`, (err) => {
-        if (err && !err.message.includes('duplicate column')) {
-          console.error(chalk.yellow('Note: current_time column may already exist'));
-        } else {
-          console.log(chalk.green('✓ current_time column ready (second-based progress)'));
-        }
-      });
-      
-      // Clean up duplicate entries (keep only the latest)
-      db.run(`
-        DELETE FROM watch_history 
-        WHERE id NOT IN (
-          SELECT MAX(id) 
-          FROM watch_history 
-          GROUP BY user_id, anime_id, episode_number, magnet_uri
-        )
-      `, (err) => {
-        if (err) {
-          console.error(chalk.red('Error cleaning duplicates:'), err);
-        } else {
-          console.log(chalk.green('✓ Duplicate watch history entries cleaned'));
-        }
-      });
-    }
-  });
+  `;
+
+  runQuery(watchHistoryTableSQL, 'Watch history');
 
   // Tamamlanan animeler tablosu
   db.run(`
@@ -287,28 +325,49 @@ function initializeDatabase() {
 // Database işlemleri için yardımcı fonksiyonlar
 export const dbGet = (query, params = []) => {
   return new Promise((resolve, reject) => {
-    db.get(query, params, (err, row) => {
-      if (err) reject(err);
-      else resolve(row);
-    });
+    if (dbType === 'postgres') {
+      db.query(query, params, (err, result) => {
+        if (err) reject(err);
+        else resolve(result.rows[0] || null);
+      });
+    } else {
+      db.get(query, params, (err, row) => {
+        if (err) reject(err);
+        else resolve(row);
+      });
+    }
   });
 };
 
 export const dbAll = (query, params = []) => {
   return new Promise((resolve, reject) => {
-    db.all(query, params, (err, rows) => {
-      if (err) reject(err);
-      else resolve(rows);
-    });
+    if (dbType === 'postgres') {
+      db.query(query, params, (err, result) => {
+        if (err) reject(err);
+        else resolve(result.rows);
+      });
+    } else {
+      db.all(query, params, (err, rows) => {
+        if (err) reject(err);
+        else resolve(rows);
+      });
+    }
   });
 };
 
 export const dbRun = (query, params = []) => {
   return new Promise((resolve, reject) => {
-    db.run(query, params, function(err) {
-      if (err) reject(err);
-      else resolve({ id: this.lastID, changes: this.changes });
-    });
+    if (dbType === 'postgres') {
+      db.query(query, params, (err, result) => {
+        if (err) reject(err);
+        else resolve({ id: result.rows[0]?.id || null, changes: result.rowCount });
+      });
+    } else {
+      db.run(query, params, function(err) {
+        if (err) reject(err);
+        else resolve({ id: this.lastID, changes: this.changes });
+      });
+    }
   });
 };
 

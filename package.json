@@ -27,6 +27,7 @@
     "jsonwebtoken": "^9.0.2",
     "matroska-subtitles": "^3.3.2",
     "multer": "^2.0.2",
+    "pg": "^8.11.3",
     "readable-stream-clone": "^1.0.0",
     "sqlite3": "^5.1.7",
     "webtorrent": "2.8.4"
