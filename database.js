@@ -6,8 +6,8 @@ import chalk from 'chalk';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// SQLite database dosyasını oluştur
-const dbPath = path.join(__dirname, 'zenshin.db');
+// SQLite database dosyasını oluştur - Render.com için /tmp kullan (yazılabilir)
+const dbPath = path.join(process.env.TMPDIR || process.env.TEMP || '/tmp', 'zenshin.db');
 
 // Database bağlantısı
 const db = new sqlite3.Database(dbPath, (err) => {
