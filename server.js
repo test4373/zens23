@@ -2236,27 +2236,26 @@ if (!fs.existsSync(hlsCacheDir)) {
   fs.mkdirSync(hlsCacheDir, { recursive: true });
 }
 
-// 🚀 OPTIMIZED HLS - Multi-quality adaptive streaming
 app.get("/hls/:magnet/:filename/master.m3u8", async (req, res) => {
   let magnet = req.params.magnet;
   let filename = decodeURIComponent(req.params.filename);
   
-  console.log(chalk.cyan('🎥 === HLS REQUEST (ADAPTIVE) ==='));
-  console.log(chalk.yellow('  File:'), filename);
+  console.log(chalk.cyan('🎥 === HLS İSTEĞİ (Uyarlanabilir) ==='));
+  console.log(chalk.yellow('  Dosya:'), filename);
   
   let tor = await client.get(magnet);
   if (!tor) {
-    return res.status(404).send('Torrent not found');
+    return res.status(404).send('Torrent bulunamadı');
   }
   
   const videoFile = tor.files.find(f => f.name === filename);
   if (!videoFile) {
-    return res.status(404).send('Video file not found');
+    return res.status(404).send('Video dosyası bulunamadı');
   }
   
   const videoPath = path.join(tor.path, videoFile.path);
   
-  // Wait for file
+  // Dosya bekle
   let retries = 0;
   while (!fs.existsSync(videoPath) && retries < 10) {
     await new Promise(resolve => setTimeout(resolve, 1000));
@@ -2264,17 +2263,17 @@ app.get("/hls/:magnet/:filename/master.m3u8", async (req, res) => {
   }
   
   if (!fs.existsSync(videoPath)) {
-    return res.status(404).send('Video not ready');
+    return res.status(404).send('Video hazır değil');
   }
   
-  // Create cache dir for this video
+  // Video için cache dizini oluştur
   const videoHash = Buffer.from(filename).toString('base64').replace(/[/+=]/g, '_');
   const videoCacheDir = path.join(hlsCacheDir, videoHash);
   const masterPlaylistPath = path.join(videoCacheDir, 'master.m3u8');
   
-  // Check cache
+  // Cache kontrolü
   if (fs.existsSync(masterPlaylistPath)) {
-    console.log(chalk.green('✅ Using cached HLS'));
+    console.log(chalk.green('✅ Önbellek HLS kullanılıyor'));
     const playlist = fs.readFileSync(masterPlaylistPath, 'utf-8');
     res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -2286,12 +2285,12 @@ app.get("/hls/:magnet/:filename/master.m3u8", async (req, res) => {
     fs.mkdirSync(videoCacheDir, { recursive: true });
   }
   
-  console.log(chalk.cyan('🔄 Creating HLS stream (COPY mode - no re-encode, instant!)...'));
+  console.log(chalk.cyan('🔄 HLS akışı oluşturuluyor (COPY modu - yeniden kodlama yok, anında!)...'));
   
   try {
-    // 🔥 TRANSMUX ONLY - No re-encoding! Just copy streams
+    // 🔥 SADECE TRANSMUX - Yeniden kodlama yok! Stream'leri kopyala
     const qualities = [
-      { name: 'original', copy: true }, // Copy mode - instant!
+      { name: 'original', copy: true }, // Copy modu - anında!
     ];
     
     const variantPromises = qualities.map((quality, idx) => {
@@ -2299,19 +2298,19 @@ app.get("/hls/:magnet/:filename/master.m3u8", async (req, res) => {
         const playlistName = `stream.m3u8`;
         const playlistPath = path.join(videoCacheDir, playlistName);
         
-        console.log(chalk.yellow(`  🎬 Transmuxing (COPY all streams - instant!)...`));
+        console.log(chalk.yellow(`  🎬 Transmux yapılıyor (Tüm stream'ler COPY - anında!)...`));
         
-        // 🔥 TRANSCODE MODE - Transcode audio to AAC for HLS compatibility
+        // 🔥 TRANSCODE MODU - HLS uyumluluğu için audio'yu AAC'ye dönüştür
         const args = [
           '-i', videoPath,
-          '-c:v', 'copy',                       // Copy video stream
-          '-c:a', 'aac',                        // Transcode audio to AAC
-          '-map', '0',                          // Include ALL streams
-          '-bsf:a', 'aac_adtstoasc',           // Fix AAC for HLS
+          '-c:v', 'copy',                       // Video stream'ini kopyala
+          '-c:a', 'aac',                        // Audio'yu AAC'ye dönüştür
+          '-map', '0',                          // TÜM stream'leri dahil et
+          '-bsf:a', 'aac_adtstoasc',           // AAC'yi HLS için düzelt
           '-start_number', '0',
-          '-hls_time', '4',                     // 4-second segments
-          '-hls_list_size', '15',               // Keep only 15 segments (60s buffer)
-          '-hls_flags', 'delete_segments+omit_endlist', // Auto-delete old!
+          '-hls_time', '4',                     // 4 saniyelik segmentler
+          '-hls_list_size', '15',               // Sadece 15 segment tut (60s buffer)
+          '-hls_flags', 'delete_segments+omit_endlist', // Eski'leri otomatik sil!
           '-hls_segment_type', 'mpegts',
           '-hls_segment_filename', path.join(videoCacheDir, 'seg%03d.ts'),
           '-f', 'hls',
@@ -2323,7 +2322,7 @@ app.get("/hls/:magnet/:filename/master.m3u8", async (req, res) => {
         let lastLog = 0;
         proc.stderr.on('data', (data) => {
           const output = data.toString();
-          // Show progress every 5 seconds
+          // Her 5 saniyede bir ilerleme göster
           if (output.includes('time=')) {
             const now = Date.now();
             if (now - lastLog > 5000) {
@@ -2338,16 +2337,16 @@ app.get("/hls/:magnet/:filename/master.m3u8", async (req, res) => {
         
         proc.on('close', (code) => {
           if (code === 0) {
-            console.log(chalk.green(`    ✅ Transmux complete (COPY mode)`));
+            console.log(chalk.green(`    ✅ Transmux tamamlandı (COPY modu)`));
             resolve({ name: playlistName, copy: true });
           } else {
-            console.error(chalk.red(`    ❌ Transmux failed with code ${code}`));
-            reject(new Error(`Transmux failed`));
+            console.error(chalk.red(`    ❌ Transmux ${code} koduyla başarısız`));
+            reject(new Error(`Transmux başarısız`));
           }
         });
         
         proc.on('error', (err) => {
-          console.error(chalk.red('    ❌ FFmpeg error:'), err.message);
+          console.error(chalk.red('    ❌ FFmpeg hatası:'), err.message);
           reject(err);
         });
       });
@@ -2355,17 +2354,17 @@ app.get("/hls/:magnet/:filename/master.m3u8", async (req, res) => {
     
     const variants = await Promise.all(variantPromises);
     
-    // Create master playlist
+    // Master playlist oluştur
     let masterContent = '#EXTM3U\n#EXT-X-VERSION:3\n\n';
     
     variants.forEach(variant => {
-      const bandwidth = parseInt(variant.bitrate) * 1000;
-      masterContent += `#EXT-X-STREAM-INF:BANDWIDTH=${bandwidth},RESOLUTION=${variant.height === 720 ? '1280x720' : '1920x1080'}\n`;
+      const bandwidth = 5000000; // Tahmini bitrate (5Mbps)
+      masterContent += `#EXT-X-STREAM-INF:BANDWIDTH=${bandwidth},RESOLUTION=1920x1080\n`;
       masterContent += `${variant.name}\n`;
     });
     
     fs.writeFileSync(masterPlaylistPath, masterContent);
-    console.log(chalk.green('✅ Master playlist created with'), variants.length, 'quality variants');
+    console.log(chalk.green('✅ Master playlist oluşturuldu,'), variants.length, 'kalite varyantı ile');
     
     res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -2373,8 +2372,8 @@ app.get("/hls/:magnet/:filename/master.m3u8", async (req, res) => {
     res.send(masterContent);
     
   } catch (error) {
-    console.error(chalk.red('❌ HLS error:'), error.message);
-    res.status(500).send('HLS conversion failed');
+    console.error(chalk.red('❌ HLS hatası:'), error.message);
+    res.status(500).send('HLS dönüştürme başarısız');
   }
 });
 
