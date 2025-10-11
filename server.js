@@ -2255,15 +2255,16 @@ app.get("/hls/:magnet/:filename/master.m3u8", async (req, res) => {
   
   const videoPath = path.join(tor.path, videoFile.path);
   
-  // Dosya bekle
+  // Dosya bekle ve tam indirilmesini bekle
   let retries = 0;
-  while (!fs.existsSync(videoPath) && retries < 10) {
-    await new Promise(resolve => setTimeout(resolve, 1000));
+  while ((!fs.existsSync(videoPath) || videoFile.downloaded < videoFile.length) && retries < 30) {
+    await new Promise(resolve => setTimeout(resolve, 2000));
     retries++;
+    console.log(chalk.yellow(`  Bekleniyor... İndirilen: ${(videoFile.downloaded / 1024 / 1024).toFixed(2)}MB / ${(videoFile.length / 1024 / 1024).toFixed(2)}MB`));
   }
-  
-  if (!fs.existsSync(videoPath)) {
-    return res.status(404).send('Video hazır değil');
+
+  if (!fs.existsSync(videoPath) || videoFile.downloaded < videoFile.length) {
+    return res.status(404).send('Video tam indirilmedi, HLS oluşturulamıyor');
   }
   
   // Video için cache dizini oluştur
@@ -2707,4 +2708,3 @@ app.listen(PORT, HOST, () => {
   console.log(chalk.green(`  🛡 Crash Protection: ON`));
   console.log(chalk.green(`  ✅ Health: ${HOST}:${PORT}/health`));
   console.log(chalk.green('═══════════════════════════════════════════'));
-});
