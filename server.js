@@ -2304,19 +2304,24 @@ app.get("/hls/:magnet/:filename/master.m3u8", async (req, res) => {
         const playlistName = `stream.m3u8`;
         const playlistPath = path.join(videoCacheDir, playlistName);
         
-        console.log(chalk.yellow(`  🎬 Transmux yapılıyor (Tüm stream'ler COPY - anında!)...`));
+        console.log(chalk.yellow(`  🎬 HLS çalışıyor (video COPY, audio AAC'ye dönüştürülüyor)...`));
         
-        // 🔥 TRANSCODE MODU - HLS uyumluluğu için audio'yu AAC'ye dönüştür
+        // 🔥 HIZLI HLS - Sadece ilk 2 dakikayı işle (instant playback için)
+        // Tam video stream olarak oynatılırken HLS arka planda tamamlanacak
         const args = [
           '-i', videoPath,
-          '-c:v', 'copy',                       // Video stream'ini kopyala
-          '-c:a', 'aac',                        // Audio'yu AAC'ye dönüştür
-          '-map', '0',                          // TÜM stream'leri dahil et
-          '-bsf:a', 'aac_adtstoasc',           // AAC'yi HLS için düzelt
+          '-t', '120',                          // 🔥 Sadece ilk 2 dakika (instant start!)
+          '-c:v', 'copy',                       // Video COPY (hızlı)
+          '-c:a', 'aac',                        // Audio AAC'ye dönüştür (HLS uyumluluğu)
+          '-ac', '2',                           // Stereo (uyumluluk)
+          '-b:a', '128k',                       // 128kbps (yeterli kalite)
+          '-map', '0:v:0',                      // İlk video stream
+          '-map', '0:a:0',                      // İlk audio stream  
+          '-bsf:a', 'aac_adtstoasc',           // AAC düzelt
           '-start_number', '0',
-          '-hls_time', '4',                     // 4 saniyelik segmentler
-          '-hls_list_size', '15',               // Sadece 15 segment tut (60s buffer)
-          '-hls_flags', 'delete_segments+omit_endlist', // Eski'leri otomatik sil!
+          '-hls_time', '2',                     // 2 saniyelik segmentler (daha responsive)
+          '-hls_list_size', '0',                // Tüm segmentleri playlist'te tut
+          '-hls_flags', 'independent_segments', // 🔥 Bağımsız segmentler (delete_segments KULLANMA!)
           '-hls_segment_type', 'mpegts',
           '-hls_segment_filename', path.join(videoCacheDir, 'seg%03d.ts'),
           '-f', 'hls',
@@ -2325,13 +2330,28 @@ app.get("/hls/:magnet/:filename/master.m3u8", async (req, res) => {
         
         const proc = spawn(ffmpegPath.path, args);
         
+        let firstSegmentCreated = false;
         let lastLog = 0;
+        
         proc.stderr.on('data', (data) => {
           const output = data.toString();
-          // Her 5 saniyede bir ilerleme göster
+          
+          // İlk segment oluşturulunca hemen response dön
+          if (!firstSegmentCreated && output.includes('.ts')) {
+            firstSegmentCreated = true;
+            console.log(chalk.green('    ✅ İlk segment hazır - Instant playback!'));
+            // İlk segment hazır olunca resolve et (30 saniye beklemeden!)
+            setTimeout(() => {
+              if (!proc.killed) {
+                resolve({ name: playlistName, copy: true });
+              }
+            }, 3000); // 3 saniye sonra resolve et
+          }
+          
+          // İlerleme göster
           if (output.includes('time=')) {
             const now = Date.now();
-            if (now - lastLog > 5000) {
+            if (now - lastLog > 3000) {
               const match = output.match(/time=(\d+):(\d+):(\d+)/);
               if (match) {
                 console.log(chalk.gray('    🔄'), `${match[1]}:${match[2]}:${match[3]}`);
@@ -2342,19 +2362,34 @@ app.get("/hls/:magnet/:filename/master.m3u8", async (req, res) => {
         });
         
         proc.on('close', (code) => {
-          if (code === 0) {
-            console.log(chalk.green(`    ✅ Transmux tamamlandı (COPY modu)`));
-            resolve({ name: playlistName, copy: true });
+          if (code === 0 || code === null) {
+            console.log(chalk.green(`    ✅ HLS tamamlandı (ilk 2 dakika)`));
+            if (!firstSegmentCreated) {
+              resolve({ name: playlistName, copy: true });
+            }
           } else {
-            console.error(chalk.red(`    ❌ Transmux ${code} koduyla başarısız`));
-            reject(new Error(`Transmux başarısız`));
+            console.error(chalk.red(`    ❌ FFmpeg ${code} koduyla kapandı`));
+            if (!firstSegmentCreated) {
+              reject(new Error(`HLS failed`));
+            }
           }
         });
         
         proc.on('error', (err) => {
           console.error(chalk.red('    ❌ FFmpeg hatası:'), err.message);
-          reject(err);
+          if (!firstSegmentCreated) {
+            reject(err);
+          }
         });
+        
+        // 🔥 Timeout - 20 saniye içinde başlamazsa hata ver
+        setTimeout(() => {
+          if (!firstSegmentCreated) {
+            console.error(chalk.red('    ❌ Timeout - İlk segment 20 saniyede oluşmadı'));
+            proc.kill();
+            reject(new Error('HLS timeout'));
+          }
+        }, 20000);
       });
     });
     
@@ -2371,6 +2406,24 @@ app.get("/hls/:magnet/:filename/master.m3u8", async (req, res) => {
     
     fs.writeFileSync(masterPlaylistPath, masterContent);
     console.log(chalk.green('✅ Master playlist oluşturuldu,'), variants.length, 'kalite varyantı ile');
+    
+    // 🔥 Stream playlist'ı da düzelt - EXT-X-ENDLIST ekle
+    setTimeout(() => {
+      try {
+        const streamPlaylistPath = path.join(videoCacheDir, 'stream.m3u8');
+        if (fs.existsSync(streamPlaylistPath)) {
+          let streamContent = fs.readFileSync(streamPlaylistPath, 'utf-8');
+          // Eğer EXT-X-ENDLIST yoksa ekle
+          if (!streamContent.includes('#EXT-X-ENDLIST')) {
+            streamContent += '\n#EXT-X-ENDLIST\n';
+            fs.writeFileSync(streamPlaylistPath, streamContent);
+            console.log(chalk.cyan('🔧 Playlist finalized with EXT-X-ENDLIST'));
+          }
+        }
+      } catch (err) {
+        console.error(chalk.yellow('⚠️ Playlist finalize error:'), err.message);
+      }
+    }, 10000); // 10 saniye sonra finalize et
     
     res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
     res.setHeader('Access-Control-Allow-Origin', '*');
