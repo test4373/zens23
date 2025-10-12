@@ -2255,20 +2255,26 @@ app.get("/hls/:magnet/:filename/master.m3u8", async (req, res) => {
   
   const videoPath = path.join(tor.path, videoFile.path);
   
-  // 🔥 STREAMING MODE: Don't wait for full download, stream from WebTorrent!
-  // Check if at least 5MB is downloaded (enough to start FFmpeg)
-  const MIN_DOWNLOAD = 5 * 1024 * 1024; // 5MB
+  // 🔥 WAIT FOR ENOUGH DATA: Need at least 50MB or 10% to get accurate duration
+  const MIN_DOWNLOAD = Math.min(50 * 1024 * 1024, videoFile.length * 0.1); // 50MB or 10%
   let retries = 0;
+  const MAX_RETRIES = 60; // 60 seconds max wait
   
-  while (videoFile.downloaded < MIN_DOWNLOAD && retries < 15) {
+  console.log(chalk.cyan(`  ⏳ Waiting for ${(MIN_DOWNLOAD / 1024 / 1024).toFixed(1)}MB to ensure accurate duration...`));
+  
+  while (videoFile.downloaded < MIN_DOWNLOAD && retries < MAX_RETRIES) {
     await new Promise(resolve => setTimeout(resolve, 1000));
     retries++;
-    console.log(chalk.yellow(`  📉 Buffering... ${(videoFile.downloaded / 1024 / 1024).toFixed(2)}MB / ${(videoFile.length / 1024 / 1024).toFixed(2)}MB`));
+    if (retries % 5 === 0) {
+      console.log(chalk.yellow(`  📉 Buffering... ${(videoFile.downloaded / 1024 / 1024).toFixed(2)}MB / ${(videoFile.length / 1024 / 1024).toFixed(2)}MB (${(videoFile.downloaded / videoFile.length * 100).toFixed(1)}%)`));
+    }
   }
   
   if (videoFile.downloaded < MIN_DOWNLOAD) {
-    return res.status(503).send('Video buffering... Retry in 5 seconds');
+    return res.status(503).send(`Video buffering... ${(videoFile.downloaded / videoFile.length * 100).toFixed(0)}% ready. Retry in 10 seconds.`);
   }
+  
+  console.log(chalk.green(`✅ Buffer ready: ${(videoFile.downloaded / 1024 / 1024).toFixed(1)}MB`));
   
   console.log(chalk.green('✅ Enough data buffered, starting HLS generation...'));
   
@@ -2306,27 +2312,46 @@ app.get("/hls/:magnet/:filename/master.m3u8", async (req, res) => {
         
         console.log(chalk.yellow(`  🎬 HLS çalışıyor (video COPY, audio AAC'ye dönüştürülüyor)...`));
         
-        // 🔥 FIXED HLS - Probe for duration first, then generate full HLS
+        // 🔥 PROBE FULL DURATION - Critical for correct HLS generation
         let videoDuration = 0;
-        try {
-          await new Promise((resolve, reject) => {
-            ffmpeg.ffprobe(videoPath, (err, metadata) => {
-              if (err) {
-                console.error(chalk.red('FFprobe error:'), err.message);
-                reject(err);
-                return;
-              }
-              videoDuration = metadata.format.duration || 0;
-              console.log(chalk.green(`  ⏱️ Video duration: ${Math.floor(videoDuration / 60)}m ${Math.floor(videoDuration % 60)}s`));
-              resolve();
+        let retryProbe = 0;
+        
+        while (videoDuration === 0 && retryProbe < 5) {
+          try {
+            videoDuration = await new Promise((resolve, reject) => {
+              ffmpeg.ffprobe(videoPath, (err, metadata) => {
+                if (err) {
+                  console.error(chalk.red('FFprobe error:'), err.message);
+                  reject(err);
+                  return;
+                }
+                const duration = metadata.format.duration || 0;
+                console.log(chalk.cyan(`  ⏱️ Probed duration: ${Math.floor(duration / 60)}m ${Math.floor(duration % 60)}s`));
+                resolve(duration);
+              });
             });
-          });
-        } catch (err) {
-          console.error(chalk.red('Could not probe video duration, using fallback'));
-          videoDuration = 1500; // 25 minutes fallback
+            
+            if (videoDuration > 0) {
+              console.log(chalk.green(`  ✅ Video duration confirmed: ${Math.floor(videoDuration / 60)}m ${Math.floor(videoDuration % 60)}s`));
+              break;
+            }
+          } catch (err) {
+            retryProbe++;
+            console.error(chalk.yellow(`  ⚠️ Probe attempt ${retryProbe} failed, retrying...`));
+            await new Promise(r => setTimeout(r, 2000));
+          }
+        }
+        
+        if (videoDuration === 0) {
+          console.error(chalk.red('❌ Could not determine video duration'));
+          reject(new Error('Cannot determine video duration'));
+          return;
         }
         
         const args = [
+          // 🔥 PROPER DURATION DETECTION
+          '-analyzeduration', '100M',  // Analyze up to 100MB
+          '-probesize', '100M',        // Probe up to 100MB
           '-i', videoPath,
           // NO -t flag - process entire video!
           '-c:v', 'copy',                       // Video COPY (hızlı)
