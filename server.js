@@ -2301,7 +2301,7 @@ app.get("/hls/:magnet/:filename/master.m3u8", async (req, res) => {
     
     const variantPromises = qualities.map((quality, idx) => {
       return new Promise((resolve, reject) => {
-        const playlistName = `stream.m3u8`;
+        const playlistName = `${idx}-stream.m3u8`;
         const playlistPath = path.join(videoCacheDir, playlistName);
         
         console.log(chalk.yellow(`  🎬 HLS çalışıyor (video COPY, audio AAC'ye dönüştürülüyor)...`));
@@ -2322,7 +2322,7 @@ app.get("/hls/:magnet/:filename/master.m3u8", async (req, res) => {
           '-hls_list_size', '0',                // Tüm segmentleri tut
           '-hls_flags', 'independent_segments', // Bağımsız segmentler
           '-hls_segment_type', 'mpegts',
-          '-hls_segment_filename', path.join(videoCacheDir, 'seg%03d.ts'),
+          '-hls_segment_filename', path.join(videoCacheDir, `${idx}-seg%03d.ts`),
           '-f', 'hls',
           playlistPath
         ];
@@ -2335,16 +2335,12 @@ app.get("/hls/:magnet/:filename/master.m3u8", async (req, res) => {
         proc.stderr.on('data', (data) => {
           const output = data.toString();
           
-          // İlk 3 segment oluşturulunca response dön (12 saniye video)
-          if (!firstSegmentCreated && output.includes('seg002.ts')) {
+          // İlk segment oluşturulunca response dön (4 saniye video)
+          if (!firstSegmentCreated && fs.existsSync(playlistPath)) {
             firstSegmentCreated = true;
-            console.log(chalk.green('    ✅ İlk 12 saniye hazır - Instant playback!'));
-            // İlk 3 segment hazır olunca resolve et
-            setTimeout(() => {
-              if (!proc.killed) {
-                resolve({ name: playlistName, copy: true });
-              }
-            }, 2000); // 2 saniye sonra resolve et
+            console.log(chalk.green('    ✅ İlk playlist hazır - Instant playback!'));
+            // Playlist oluşturulunca hemen resolve et
+            resolve({ name: playlistName, copy: true, idx: idx });
           }
           
           // İlerleme göster
@@ -2363,13 +2359,26 @@ app.get("/hls/:magnet/:filename/master.m3u8", async (req, res) => {
         proc.on('close', (code) => {
           if (code === 0 || code === null) {
             console.log(chalk.green(`    ✅ HLS tamamlandı (5 dakika)`));
+            // Finalize playlist - EXT-X-ENDLIST ekle
+            try {
+              if (fs.existsSync(playlistPath)) {
+                let content = fs.readFileSync(playlistPath, 'utf-8');
+                if (!content.includes('#EXT-X-ENDLIST')) {
+                  content += '\n#EXT-X-ENDLIST\n';
+                  fs.writeFileSync(playlistPath, content);
+                  console.log(chalk.cyan('      🔧 Playlist finalized'));
+                }
+              }
+            } catch (err) {
+              console.error(chalk.yellow('      ⚠️ Finalize error:'), err.message);
+            }
             if (!firstSegmentCreated) {
-              resolve({ name: playlistName, copy: true });
+              resolve({ name: playlistName, copy: true, idx: idx });
             }
           } else {
             console.error(chalk.red(`    ❌ FFmpeg ${code} koduyla kapandı`));
             if (!firstSegmentCreated) {
-              reject(new Error(`HLS failed`));
+              reject(new Error(`HLS failed with code ${code}`));
             }
           }
         });
@@ -2397,32 +2406,17 @@ app.get("/hls/:magnet/:filename/master.m3u8", async (req, res) => {
     // Master playlist oluştur
     let masterContent = '#EXTM3U\n#EXT-X-VERSION:3\n\n';
     
-    variants.forEach(variant => {
+    variants.forEach((variant, idx) => {
       const bandwidth = 5000000; // Tahmini bitrate (5Mbps)
-      masterContent += `#EXT-X-STREAM-INF:BANDWIDTH=${bandwidth},RESOLUTION=1920x1080\n`;
+      const resolution = '1920x1080';
+      masterContent += `#EXT-X-STREAM-INF:BANDWIDTH=${bandwidth},RESOLUTION=${resolution},NAME="Original"\n`;
       masterContent += `${variant.name}\n`;
     });
     
     fs.writeFileSync(masterPlaylistPath, masterContent);
     console.log(chalk.green('✅ Master playlist oluşturuldu,'), variants.length, 'kalite varyantı ile');
     
-    // 🔥 Stream playlist'ı da düzelt - EXT-X-ENDLIST ekle
-    setTimeout(() => {
-      try {
-        const streamPlaylistPath = path.join(videoCacheDir, 'stream.m3u8');
-        if (fs.existsSync(streamPlaylistPath)) {
-          let streamContent = fs.readFileSync(streamPlaylistPath, 'utf-8');
-          // Eğer EXT-X-ENDLIST yoksa ekle
-          if (!streamContent.includes('#EXT-X-ENDLIST')) {
-            streamContent += '\n#EXT-X-ENDLIST\n';
-            fs.writeFileSync(streamPlaylistPath, streamContent);
-            console.log(chalk.cyan('🔧 Playlist finalized with EXT-X-ENDLIST'));
-          }
-        }
-      } catch (err) {
-        console.error(chalk.yellow('⚠️ Playlist finalize error:'), err.message);
-      }
-    }, 10000); // 10 saniye sonra finalize et
+    // Playlists will be finalized when FFmpeg closes
     
     res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
     res.setHeader('Access-Control-Allow-Origin', '*');
