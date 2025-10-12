@@ -2306,22 +2306,21 @@ app.get("/hls/:magnet/:filename/master.m3u8", async (req, res) => {
         
         console.log(chalk.yellow(`  🎬 HLS çalışıyor (video COPY, audio AAC'ye dönüştürülüyor)...`));
         
-        // 🔥 HIZLI HLS - Sadece ilk 2 dakikayı işle (instant playback için)
-        // Tam video stream olarak oynatılırken HLS arka planda tamamlanacak
+        // 🔥 TAM HLS - İlk 5 dakikayı işle (yeterli uzunluk)
         const args = [
           '-i', videoPath,
-          '-t', '120',                          // 🔥 Sadece ilk 2 dakika (instant start!)
+          '-t', '300',                          // 🔥 İlk 5 dakika (daha uzun!)
           '-c:v', 'copy',                       // Video COPY (hızlı)
-          '-c:a', 'aac',                        // Audio AAC'ye dönüştür (HLS uyumluluğu)
-          '-ac', '2',                           // Stereo (uyumluluk)
-          '-b:a', '128k',                       // 128kbps (yeterli kalite)
+          '-c:a', 'aac',                        // Audio AAC'ye dönüştür
+          '-ac', '2',                           // Stereo
+          '-b:a', '128k',                       // 128kbps
           '-map', '0:v:0',                      // İlk video stream
           '-map', '0:a:0',                      // İlk audio stream  
           '-bsf:a', 'aac_adtstoasc',           // AAC düzelt
           '-start_number', '0',
-          '-hls_time', '2',                     // 2 saniyelik segmentler (daha responsive)
-          '-hls_list_size', '0',                // Tüm segmentleri playlist'te tut
-          '-hls_flags', 'independent_segments', // 🔥 Bağımsız segmentler (delete_segments KULLANMA!)
+          '-hls_time', '4',                     // 4 saniyelik segmentler
+          '-hls_list_size', '0',                // Tüm segmentleri tut
+          '-hls_flags', 'independent_segments', // Bağımsız segmentler
           '-hls_segment_type', 'mpegts',
           '-hls_segment_filename', path.join(videoCacheDir, 'seg%03d.ts'),
           '-f', 'hls',
@@ -2336,22 +2335,22 @@ app.get("/hls/:magnet/:filename/master.m3u8", async (req, res) => {
         proc.stderr.on('data', (data) => {
           const output = data.toString();
           
-          // İlk segment oluşturulunca hemen response dön
-          if (!firstSegmentCreated && output.includes('.ts')) {
+          // İlk 3 segment oluşturulunca response dön (12 saniye video)
+          if (!firstSegmentCreated && output.includes('seg002.ts')) {
             firstSegmentCreated = true;
-            console.log(chalk.green('    ✅ İlk segment hazır - Instant playback!'));
-            // İlk segment hazır olunca resolve et (30 saniye beklemeden!)
+            console.log(chalk.green('    ✅ İlk 12 saniye hazır - Instant playback!'));
+            // İlk 3 segment hazır olunca resolve et
             setTimeout(() => {
               if (!proc.killed) {
                 resolve({ name: playlistName, copy: true });
               }
-            }, 3000); // 3 saniye sonra resolve et
+            }, 2000); // 2 saniye sonra resolve et
           }
           
           // İlerleme göster
           if (output.includes('time=')) {
             const now = Date.now();
-            if (now - lastLog > 3000) {
+            if (now - lastLog > 5000) {
               const match = output.match(/time=(\d+):(\d+):(\d+)/);
               if (match) {
                 console.log(chalk.gray('    🔄'), `${match[1]}:${match[2]}:${match[3]}`);
@@ -2363,7 +2362,7 @@ app.get("/hls/:magnet/:filename/master.m3u8", async (req, res) => {
         
         proc.on('close', (code) => {
           if (code === 0 || code === null) {
-            console.log(chalk.green(`    ✅ HLS tamamlandı (ilk 2 dakika)`));
+            console.log(chalk.green(`    ✅ HLS tamamlandı (5 dakika)`));
             if (!firstSegmentCreated) {
               resolve({ name: playlistName, copy: true });
             }
