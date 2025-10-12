@@ -2306,10 +2306,29 @@ app.get("/hls/:magnet/:filename/master.m3u8", async (req, res) => {
         
         console.log(chalk.yellow(`  🎬 HLS çalışıyor (video COPY, audio AAC'ye dönüştürülüyor)...`));
         
-        // 🔥 TAM HLS - İlk 5 dakikayı işle (yeterli uzunluk)
+        // 🔥 FIXED HLS - Probe for duration first, then generate full HLS
+        let videoDuration = 0;
+        try {
+          await new Promise((resolve, reject) => {
+            ffmpeg.ffprobe(videoPath, (err, metadata) => {
+              if (err) {
+                console.error(chalk.red('FFprobe error:'), err.message);
+                reject(err);
+                return;
+              }
+              videoDuration = metadata.format.duration || 0;
+              console.log(chalk.green(`  ⏱️ Video duration: ${Math.floor(videoDuration / 60)}m ${Math.floor(videoDuration % 60)}s`));
+              resolve();
+            });
+          });
+        } catch (err) {
+          console.error(chalk.red('Could not probe video duration, using fallback'));
+          videoDuration = 1500; // 25 minutes fallback
+        }
+        
         const args = [
           '-i', videoPath,
-          '-t', '300',                          // 🔥 İlk 5 dakika (daha uzun!)
+          // NO -t flag - process entire video!
           '-c:v', 'copy',                       // Video COPY (hızlı)
           '-c:a', 'aac',                        // Audio AAC'ye dönüştür
           '-ac', '2',                           // Stereo
@@ -2318,11 +2337,12 @@ app.get("/hls/:magnet/:filename/master.m3u8", async (req, res) => {
           '-map', '0:a:0',                      // İlk audio stream  
           '-bsf:a', 'aac_adtstoasc',           // AAC düzelt
           '-start_number', '0',
-          '-hls_time', '4',                     // 4 saniyelik segmentler
+          '-hls_time', '6',                     // 6 saniyelik segmentler (daha büyük = daha hızlı)
           '-hls_list_size', '0',                // Tüm segmentleri tut
           '-hls_flags', 'independent_segments', // Bağımsız segmentler
           '-hls_segment_type', 'mpegts',
           '-hls_segment_filename', path.join(videoCacheDir, `${idx}-seg%03d.ts`),
+          '-hls_playlist_type', 'vod',          // VOD mode for proper duration
           '-f', 'hls',
           playlistPath
         ];
@@ -2335,21 +2355,36 @@ app.get("/hls/:magnet/:filename/master.m3u8", async (req, res) => {
         proc.stderr.on('data', (data) => {
           const output = data.toString();
           
-          // İlk segment oluşturulunca response dön (4 saniye video)
+          // İlk segment oluşturulunca response dön
           if (!firstSegmentCreated && fs.existsSync(playlistPath)) {
-            firstSegmentCreated = true;
-            console.log(chalk.green('    ✅ İlk playlist hazır - Instant playback!'));
-            // Playlist oluşturulunca hemen resolve et
-            resolve({ name: playlistName, copy: true, idx: idx });
+            // Check if playlist has at least 2 segments (enough to start playback)
+            try {
+              const playlistContent = fs.readFileSync(playlistPath, 'utf-8');
+              const segmentCount = (playlistContent.match(/\.ts/g) || []).length;
+              
+              if (segmentCount >= 2) {
+                firstSegmentCreated = true;
+                console.log(chalk.green('    ✅ İlk 2 segment hazır - Instant playback!'));
+                // Resolve immediately with 2 segments ready
+                resolve({ name: playlistName, copy: true, idx: idx });
+              }
+            } catch (err) {
+              // Ignore read errors, will retry
+            }
           }
           
           // İlerleme göster
           if (output.includes('time=')) {
             const now = Date.now();
-            if (now - lastLog > 5000) {
-              const match = output.match(/time=(\d+):(\d+):(\d+)/);
+            if (now - lastLog > 3000) { // Her 3 saniyede log
+              const match = output.match(/time=(\d+):(\d+):(\d+\.\d+)/);
               if (match) {
-                console.log(chalk.gray('    🔄'), `${match[1]}:${match[2]}:${match[3]}`);
+                const hours = parseInt(match[1]);
+                const mins = parseInt(match[2]);
+                const secs = parseFloat(match[3]);
+                const totalSecs = hours * 3600 + mins * 60 + secs;
+                const progress = videoDuration > 0 ? ((totalSecs / videoDuration) * 100).toFixed(1) : '?';
+                console.log(chalk.gray('    🔄'), `${match[1]}:${match[2]}:${Math.floor(secs)} (${progress}%)`);
                 lastLog = now;
               }
             }
