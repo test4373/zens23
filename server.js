@@ -2300,7 +2300,7 @@ app.get("/hls/:magnet/:filename/master.m3u8", async (req, res) => {
     ];
     
     const variantPromises = qualities.map((quality, idx) => {
-      return new Promise((resolve, reject) => {
+      return new Promise(async (resolve, reject) => {
         const playlistName = `${idx}-stream.m3u8`;
         const playlistPath = path.join(videoCacheDir, playlistName);
         
