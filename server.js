@@ -2255,17 +2255,17 @@ app.get("/hls/:magnet/:filename/master.m3u8", async (req, res) => {
   
   const videoPath = path.join(tor.path, videoFile.path);
   
-  // 🔥 WAIT FOR ENOUGH DATA: Need at least 50MB or 10% to get accurate duration
-  const MIN_DOWNLOAD = Math.min(50 * 1024 * 1024, videoFile.length * 0.1); // 50MB or 10%
+  // 🔥 INCREASED BUFFER WAIT: Need at least 100MB or 20% for accurate duration and timestamps
+  const MIN_DOWNLOAD = Math.min(100 * 1024 * 1024, videoFile.length * 0.2); // 100MB or 20%
   let retries = 0;
-  const MAX_RETRIES = 60; // 60 seconds max wait
+  const MAX_RETRIES = 120; // 2 minutes max wait for better accuracy
   
-  console.log(chalk.cyan(`  ⏳ Waiting for ${(MIN_DOWNLOAD / 1024 / 1024).toFixed(1)}MB to ensure accurate duration...`));
+  console.log(chalk.cyan(`  ⏳ Waiting for ${(MIN_DOWNLOAD / 1024 / 1024).toFixed(1)}MB to ensure accurate duration and timestamps...`));
   
   while (videoFile.downloaded < MIN_DOWNLOAD && retries < MAX_RETRIES) {
     await new Promise(resolve => setTimeout(resolve, 1000));
     retries++;
-    if (retries % 5 === 0) {
+    if (retries % 10 === 0) { // Log every 10s
       console.log(chalk.yellow(`  📉 Buffering... ${(videoFile.downloaded / 1024 / 1024).toFixed(2)}MB / ${(videoFile.length / 1024 / 1024).toFixed(2)}MB (${(videoFile.downloaded / videoFile.length * 100).toFixed(1)}%)`));
     }
   }
@@ -2312,21 +2312,26 @@ app.get("/hls/:magnet/:filename/master.m3u8", async (req, res) => {
         
         console.log(chalk.yellow(`  🎬 HLS çalışıyor (video COPY, audio AAC'ye dönüştürülüyor)...`));
         
-        // 🔥 PROBE FULL DURATION - Critical for correct HLS generation
+        // 🔥 IMPROVED PROBE: Multiple retries with increased probe size for accurate duration
         let videoDuration = 0;
         let retryProbe = 0;
+        const MAX_PROBE_RETRIES = 10; // Increased retries
         
-        while (videoDuration === 0 && retryProbe < 5) {
+        while (videoDuration === 0 && retryProbe < MAX_PROBE_RETRIES) {
           try {
             videoDuration = await new Promise((resolve, reject) => {
-              ffmpeg.ffprobe(videoPath, (err, metadata) => {
+              // Use enhanced ffprobe with larger probe size
+              ffmpeg.ffprobe(videoPath, {
+                analyzeduration: '500M',  // Increased to 500MB
+                probesize: '500M'         // Increased to 500MB
+              }, (err, metadata) => {
                 if (err) {
                   console.error(chalk.red('FFprobe error:'), err.message);
                   reject(err);
                   return;
                 }
                 const duration = metadata.format.duration || 0;
-                console.log(chalk.cyan(`  ⏱️ Probed duration: ${Math.floor(duration / 60)}m ${Math.floor(duration % 60)}s`));
+                console.log(chalk.cyan(`  ⏱️ Probed duration (attempt ${retryProbe + 1}): ${Math.floor(duration / 60)}m ${Math.floor(duration % 60)}s`));
                 resolve(duration);
               });
             });
@@ -2338,20 +2343,22 @@ app.get("/hls/:magnet/:filename/master.m3u8", async (req, res) => {
           } catch (err) {
             retryProbe++;
             console.error(chalk.yellow(`  ⚠️ Probe attempt ${retryProbe} failed, retrying...`));
-            await new Promise(r => setTimeout(r, 2000));
+            await new Promise(r => setTimeout(r, 3000)); // Wait longer between probes
           }
         }
         
         if (videoDuration === 0) {
-          console.error(chalk.red('❌ Could not determine video duration'));
+          console.error(chalk.red('❌ Could not determine video duration after multiple attempts'));
           reject(new Error('Cannot determine video duration'));
           return;
         }
         
         const args = [
-          // 🔥 PROPER DURATION DETECTION
-          '-analyzeduration', '100M',  // Analyze up to 100MB
-          '-probesize', '100M',        // Probe up to 100MB
+          // 🔥 TIMESTAMP FIXES: Generate and fix PTS/DTS for accurate segmentation
+          '-fflags', '+genpts+igndts',  // Generate PTS, ignore DTS
+          '-avoid_negative_ts', 'make_zero',  // Fix negative timestamps
+          '-analyzeduration', '500M',   // Increased analysis
+          '-probesize', '500M',         // Increased probe size
           '-i', videoPath,
           // NO -t flag - process entire video!
           '-c:v', 'copy',                       // Video COPY (hızlı)
@@ -2362,7 +2369,7 @@ app.get("/hls/:magnet/:filename/master.m3u8", async (req, res) => {
           '-map', '0:a:0',                      // İlk audio stream  
           '-bsf:a', 'aac_adtstoasc',           // AAC düzelt
           '-start_number', '0',
-          '-hls_time', '6',                     // 6 saniyelik segmentler (daha büyük = daha hızlı)
+          '-hls_time', '10',                    // Increased to 10s for stability (less segments, fewer errors)
           '-hls_list_size', '0',                // Tüm segmentleri tut
           '-hls_flags', 'independent_segments', // Bağımsız segmentler
           '-hls_segment_type', 'mpegts',
@@ -2382,15 +2389,15 @@ app.get("/hls/:magnet/:filename/master.m3u8", async (req, res) => {
           
           // İlk segment oluşturulunca response dön
           if (!firstSegmentCreated && fs.existsSync(playlistPath)) {
-            // Check if playlist has at least 2 segments (enough to start playback)
+            // Check if playlist has at least 3 segments (more buffer for stability)
             try {
               const playlistContent = fs.readFileSync(playlistPath, 'utf-8');
               const segmentCount = (playlistContent.match(/\.ts/g) || []).length;
               
-              if (segmentCount >= 2) {
+              if (segmentCount >= 3) {
                 firstSegmentCreated = true;
-                console.log(chalk.green('    ✅ İlk 2 segment hazır - Instant playback!'));
-                // Resolve immediately with 2 segments ready
+                console.log(chalk.green('    ✅ İlk 3 segment hazır - Accurate playback!'));
+                // Resolve immediately with segments ready
                 resolve({ name: playlistName, copy: true, idx: idx });
               }
             } catch (err) {
@@ -2401,7 +2408,7 @@ app.get("/hls/:magnet/:filename/master.m3u8", async (req, res) => {
           // İlerleme göster
           if (output.includes('time=')) {
             const now = Date.now();
-            if (now - lastLog > 3000) { // Her 3 saniyede log
+            if (now - lastLog > 5000) { // Log every 5s
               const match = output.match(/time=(\d+):(\d+):(\d+\.\d+)/);
               if (match) {
                 const hours = parseInt(match[1]);
@@ -2418,7 +2425,7 @@ app.get("/hls/:magnet/:filename/master.m3u8", async (req, res) => {
         
         proc.on('close', (code) => {
           if (code === 0 || code === null) {
-            console.log(chalk.green(`    ✅ HLS tamamlandı (5 dakika)`));
+            console.log(chalk.green(`    ✅ HLS tamamlandı (${Math.floor(videoDuration / 60)}m)`));
             // Finalize playlist - EXT-X-ENDLIST ekle
             try {
               if (fs.existsSync(playlistPath)) {
@@ -2426,7 +2433,7 @@ app.get("/hls/:magnet/:filename/master.m3u8", async (req, res) => {
                 if (!content.includes('#EXT-X-ENDLIST')) {
                   content += '\n#EXT-X-ENDLIST\n';
                   fs.writeFileSync(playlistPath, content);
-                  console.log(chalk.cyan('      🔧 Playlist finalized'));
+                  console.log(chalk.cyan('      🔧 Playlist finalized with correct duration'));
                 }
               }
             } catch (err) {
@@ -2450,14 +2457,14 @@ app.get("/hls/:magnet/:filename/master.m3u8", async (req, res) => {
           }
         });
         
-        // 🔥 Timeout - 20 saniye içinde başlamazsa hata ver
+        // 🔥 Extended Timeout - 30 seconds for first segments with better probing
         setTimeout(() => {
           if (!firstSegmentCreated) {
-            console.error(chalk.red('    ❌ Timeout - İlk segment 20 saniyede oluşmadı'));
+            console.error(chalk.red('    ❌ Timeout - İlk segment 30 saniyede oluşmadı'));
             proc.kill();
-            reject(new Error('HLS timeout'));
+            reject(new Error('HLS timeout - increase buffer if persists'));
           }
-        }, 20000);
+        }, 30000);
       });
     });
     
