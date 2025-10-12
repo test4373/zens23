@@ -2255,17 +2255,22 @@ app.get("/hls/:magnet/:filename/master.m3u8", async (req, res) => {
   
   const videoPath = path.join(tor.path, videoFile.path);
   
-  // Dosya bekle ve tam indirilmesini bekle
+  // 🔥 STREAMING MODE: Don't wait for full download, stream from WebTorrent!
+  // Check if at least 5MB is downloaded (enough to start FFmpeg)
+  const MIN_DOWNLOAD = 5 * 1024 * 1024; // 5MB
   let retries = 0;
-  while ((!fs.existsSync(videoPath) || videoFile.downloaded < videoFile.length) && retries < 30) {
-    await new Promise(resolve => setTimeout(resolve, 2000));
+  
+  while (videoFile.downloaded < MIN_DOWNLOAD && retries < 15) {
+    await new Promise(resolve => setTimeout(resolve, 1000));
     retries++;
-    console.log(chalk.yellow(`  Bekleniyor... İndirilen: ${(videoFile.downloaded / 1024 / 1024).toFixed(2)}MB / ${(videoFile.length / 1024 / 1024).toFixed(2)}MB`));
+    console.log(chalk.yellow(`  📉 Buffering... ${(videoFile.downloaded / 1024 / 1024).toFixed(2)}MB / ${(videoFile.length / 1024 / 1024).toFixed(2)}MB`));
   }
-
-  if (!fs.existsSync(videoPath) || videoFile.downloaded < videoFile.length) {
-    return res.status(404).send('Video tam indirilmedi, HLS oluşturulamıyor');
+  
+  if (videoFile.downloaded < MIN_DOWNLOAD) {
+    return res.status(503).send('Video buffering... Retry in 5 seconds');
   }
+  
+  console.log(chalk.green('✅ Enough data buffered, starting HLS generation...'));
   
   // Video için cache dizini oluştur
   const videoHash = Buffer.from(filename).toString('base64').replace(/[/+=]/g, '_');
