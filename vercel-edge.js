@@ -3,7 +3,8 @@
  * ✅ 100 GB bandwidth/month (FREE)
  * ✅ Unlimited requests
  * ✅ Global edge network (70+ locations)
- * ✅ No daily limits!
+ * ✅ No daily limitstw
+ !
  * 
  * Deploy: vercel --prod
  */
