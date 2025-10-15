@@ -98,6 +98,55 @@ if (fs.existsSync(localSubsDir)) {
 
 const app = express();
 
+// === Security/Resilience helpers ===
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '*')
+  .split(',')
+  .map(o => o.trim())
+  .filter(Boolean);
+
+const isOriginAllowed = (origin) => {
+  if (!origin) return true; // allow same-origin/non-browser
+  if (ALLOWED_ORIGINS.includes('*')) return true;
+  return ALLOWED_ORIGINS.includes(origin);
+};
+
+const isLocalIp = (ip) => {
+  return ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1' ||
+         ip.startsWith('192.168.') || ip.startsWith('10.') || ip.startsWith('172.');
+};
+
+const requireLocalOrToken = (req, res, next) => {
+  const clientIP = req.ip || req.connection?.remoteAddress || '';
+  const token = req.header('x-admin-token');
+  if (isLocalIp(clientIP)) return next();
+  if (process.env.ADMIN_TOKEN && token === process.env.ADMIN_TOKEN) return next();
+  return res.status(403).json({ error: 'Forbidden' });
+};
+
+const isValidHttpUrl = (value) => {
+  try {
+    const u = new URL(value);
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+const withTimeout = async (promise, ms, onAbort) => {
+  const controller = new AbortController();
+  const id = setTimeout(() => {
+    controller.abort();
+    if (onAbort) onAbort();
+  }, ms);
+  try {
+    const res = await promise(controller.signal);
+    return res;
+  } finally {
+    clearTimeout(id);
+  }
+};
+
 // Local server - no proxy needed
 // app.set('trust proxy', 1);
 
@@ -164,10 +213,13 @@ app.use(helmet({
 }));
 // Local CORS - allow all for development
 app.use(cors({
-  origin: '*', // Allow all origins for local development
+  origin: (origin, callback) => {
+    if (isOriginAllowed(origin)) return callback(null, true);
+    return callback(new Error('Not allowed by CORS'));
+  },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS', 'HEAD'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'Range', 'Content-Range', 'Accept-Ranges', 'X-Admin-Token'],
   exposedHeaders: ['X-Subtitle-Type', 'Content-Type', 'Content-Range', 'Accept-Ranges']
 }));
 
@@ -257,9 +309,9 @@ const currentVersion = "v1.0.0"; // Replace with the current version
 
 const getLatestRelease = async () => {
   try {
-    const response = await fetch(
-      `https://api.github.com/repos/${owner}/${repo}/releases/latest`
-    );
+    const response = await withTimeout((signal) => fetch(
+      `https://api.github.com/repos/${owner}/${repo}/releases/latest`, { signal }
+    ), 5000);
 
     if (!response.ok) {
       throw new Error(`HTTP error! status: ${response.status}`);
@@ -391,18 +443,259 @@ app.get("/metadata/:magnet", async (req, res) => {
     res.status(200).json(files);
   });
   
-  // 🔥 Log download progress
+  // 🔥 Log download progress (debounced to unique integer percent)
+  let lastLoggedPercent = -1;
   torrent.on('download', () => {
-    if (torrent.progress > 0.01 && torrent.progress % 0.1 < 0.01) {
-      console.log(chalk.cyan(`💾 Caching: ${(torrent.progress * 100).toFixed(0)}%`));
+    const currentPercent = Math.floor(torrent.progress * 100);
+    if (currentPercent !== lastLoggedPercent) {
+      lastLoggedPercent = currentPercent;
+      console.log(chalk.cyan(`💾 Caching: ${currentPercent}%`));
     }
   });
 });
 
-// 🔥 VIDEO CHUNK SIZE: Optimize for smooth playback without freezing
-const OPTIMAL_VIDEO_CHUNK = 512 * 1024; // 512KB - Smaller chunks for smoother streaming
-const PREFETCH_SIZE = 2 * 1024 * 1024; // 2MB prefetch
-const MAX_CHUNK = 1 * 1024 * 1024; // 1MB max chunk size
+// 🔥 NO BUFFERING - Large chunks for immediate streaming
+const OPTIMAL_VIDEO_CHUNK = 20 * 1024 * 1024;  // 20MB - Large initial chunk
+const PREFETCH_SIZE = 0;                       // 0MB - No prefetch to prevent buffering
+const MAX_CHUNK = 50 * 1024 * 1024;            // 50MB - Very large chunks
+
+// 🚫 IDM Detection and Blocking with Rate Limiting
+const requestCounts = new Map();
+const IDM_BLOCK_DURATION = 5 * 60 * 1000; // 5 minutes
+
+const detectAndBlockIDM = (req, res, next) => {
+  const userAgent = req.headers['user-agent'] || '';
+  const referer = req.headers.referer || '';
+  const accept = req.headers.accept || '';
+  const connection = req.headers.connection || '';
+  const clientIP = req.ip || req.connection.remoteAddress;
+  
+  // Whitelist localhost and development IPs
+  const isLocalhost = isLocalIp(clientIP);
+  
+  if (isLocalhost) {
+    console.log(chalk.green('✅ Localhost request - skipping IDM check'));
+    return next();
+  }
+  
+  // Check if IP is already blocked
+  if (requestCounts.has(clientIP)) {
+    const { count, lastRequest, blocked } = requestCounts.get(clientIP);
+    const now = Date.now();
+    
+    if (blocked && (now - lastRequest) < IDM_BLOCK_DURATION) {
+      console.log(chalk.red('🚫 BLOCKED IP trying to access:'), clientIP);
+      res.status(403).json({
+        error: 'IP Blocked',
+        message: 'Bu IP adresi geçici olarak engellenmiştir. Lütfen daha sonra tekrar deneyin.',
+        code: 'IP_BLOCKED',
+        retryAfter: Math.ceil((IDM_BLOCK_DURATION - (now - lastRequest)) / 1000)
+      });
+      return;
+    }
+    
+    // Reset if block duration passed
+    if (blocked && (now - lastRequest) >= IDM_BLOCK_DURATION) {
+      requestCounts.delete(clientIP);
+    }
+  }
+  
+  // IDM detection patterns
+  const idmPatterns = [
+    /Internet Download Manager/i,
+    /IDM/i,
+    /IDMan/i,
+    /InternetDownloadManager/i,
+    /Wget/i,
+    /curl/i,
+    /aria2/i,
+    /axel/i,
+    /lftp/i,
+    /wget/i
+  ];
+  
+  // Check for IDM-specific headers and patterns - More lenient detection
+  const isIDM = idmPatterns.some(pattern => pattern.test(userAgent)) ||
+                req.headers['x-idm-version'] ||
+                req.headers['x-idm-client'] ||
+                req.headers['x-downloader'] ||
+                req.headers['x-requested-with'] === 'IDM' ||
+                req.headers['x-downloader-type'] ||
+                // Only block if multiple suspicious patterns match
+                ((accept.includes('*/*') && connection === 'close' && !referer) &&
+                 (userAgent.includes('Mozilla') && !req.headers['accept-language']) &&
+                 (req.headers['accept-encoding'] === 'identity'));
+  
+  if (isIDM) {
+    console.log(chalk.red('🚫 IDM DETECTED AND BLOCKED:'));
+    console.log(chalk.yellow('  User-Agent:'), userAgent);
+    console.log(chalk.yellow('  IP:'), clientIP);
+    console.log(chalk.yellow('  Headers:'), JSON.stringify(req.headers, null, 2));
+    
+    // Block IP for 5 minutes
+    requestCounts.set(clientIP, {
+      count: 0,
+      lastRequest: Date.now(),
+      blocked: true
+    });
+    
+    res.status(403).json({
+      error: 'Download Manager Not Allowed',
+      message: 'Bu site download manager\'ları desteklemiyor. Lütfen tarayıcınızın normal video oynatıcısını kullanın.',
+      code: 'IDM_BLOCKED',
+      timestamp: new Date().toISOString()
+    });
+    return;
+  }
+  
+  // Rate limiting for suspicious requests
+  const now = Date.now();
+  const requestData = requestCounts.get(clientIP) || { count: 0, lastRequest: now, blocked: false };
+  
+  // Reset count if more than 1 minute passed
+  if (now - requestData.lastRequest > 60000) {
+    requestData.count = 0;
+  }
+  
+  requestData.count++;
+  requestData.lastRequest = now;
+  
+  // Block if too many requests (potential IDM)
+  if (requestData.count > 20) {
+    console.log(chalk.red('🚫 TOO MANY REQUESTS - BLOCKING IP:'), clientIP);
+    requestData.blocked = true;
+    requestCounts.set(clientIP, requestData);
+    
+    res.status(429).json({
+      error: 'Too Many Requests',
+      message: 'Çok fazla istek gönderildi. Lütfen daha sonra tekrar deneyin.',
+      code: 'RATE_LIMITED',
+      retryAfter: 60
+    });
+    return;
+  }
+  
+  requestCounts.set(clientIP, requestData);
+  next();
+};
+
+// Apply IDM blocking to all video streaming endpoints
+app.use('/streamfile', detectAndBlockIDM);
+app.use('/streamfile-transcode', detectAndBlockIDM);
+app.use('/dash', detectAndBlockIDM);
+app.use('/hls', detectAndBlockIDM);
+
+// Development endpoint to clear blocked IPs
+app.post('/admin/clear-blocked-ips', requireLocalOrToken, (req, res) => {
+  requestCounts.clear();
+  console.log(chalk.green('🧹 Cleared all blocked IPs'));
+  res.json({ success: true, message: 'All blocked IPs cleared' });
+});
+
+// TTL cleanup for requestCounts to avoid unbounded growth
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, data] of requestCounts.entries()) {
+    if (now - data.lastRequest > 10 * 60 * 1000) {
+      requestCounts.delete(ip);
+    }
+  }
+}, 5 * 60 * 1000);
+
+// Handle OPTIONS requests for transcoding endpoint
+app.options("/streamfile-transcode/:magnet/:filename", (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Range, Content-Range, Content-Length, Content-Type');
+  res.setHeader('Access-Control-Expose-Headers', 'Content-Range, Accept-Ranges, Content-Length');
+  res.status(200).end();
+});
+
+// 🔥 AUDIO TRANSCODING ENDPOINT - Converts unsupported codecs to AAC
+app.get("/streamfile-transcode/:magnet/:filename", async function (req, res, next) {
+  let magnet = req.params.magnet;
+  let filename = decodeURIComponent(req.params.filename);
+  
+  console.log(chalk.cyan('\n🎵 Audio transcoding request:'));
+  console.log(chalk.yellow('  Filename:'), filename);
+  console.log(chalk.cyan('  🔄 EAC3/AC3 → AAC conversion'));
+  
+  let tor = await client.get(magnet);
+  if (!tor) {
+    return res.status(404).send('Torrent not found');
+  }
+  
+  let file = tor.files.find((f) => f.name === filename);
+  if (!file) {
+    return res.status(404).send('File not found');
+  }
+  
+  const videoPath = path.join(tor.path, file.path);
+  
+  // Wait for minimum data and ensure header is present before probing/transcoding
+  const MIN_DATA = Math.min(12 * 1024 * 1024, Math.floor(file.length * 0.025));
+  let retries = 0;
+  
+  while ((file.downloaded < MIN_DATA || !fs.existsSync(videoPath)) && retries < 30) {
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    retries++;
+  }
+  
+  if (file.downloaded < MIN_DATA || !fs.existsSync(videoPath)) {
+    return res.status(503).send('Buffering, retry in 5s');
+  }
+  
+  // Use fragmented MP4 for browser compatibility
+  res.setHeader('Content-Type', 'video/mp4');
+  res.setHeader('Accept-Ranges', 'bytes');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Range, Content-Range, Content-Length, Content-Type');
+  res.setHeader('Access-Control-Expose-Headers', 'Content-Range, Accept-Ranges, Content-Length');
+  
+  // Optional time-shifted start (server-side seek)
+  const startParam = parseFloat(req.query.t || req.query.start || '0');
+  const startSec = Number.isFinite(startParam) && startParam > 1 ? Math.min(startParam, 6 * 3600) : 0; // Cap to 6h
+
+  const proc = ffmpeg(videoPath);
+  if (startSec > 0) {
+    console.log(chalk.cyan('  ⏩ Time-shifted start at:'), startSec, 's');
+    // Place -ss before input for fast seeking
+    proc.seekInput(startSec);
+  }
+
+  proc
+    .outputOptions([
+      // Probe larger to stabilize on partial MKV
+      '-analyzeduration', '32M',
+      '-probesize', '32M',
+      // Map first video and first audio only to avoid multi-track drift
+      '-map', '0:v:0',
+      '-map', '0:a:0',
+      // copy video (no re-encode); transcode audio to AAC
+      '-c:v', 'copy',
+      '-c:a', 'aac',
+      '-b:a', '256k',
+      '-ac', '2',
+      '-ar', '48000',
+      // Simple audio sync compensation
+      '-af', 'aresample=async=1',
+      // Minimal timestamp handling
+      '-async', '1',
+      // fragmented MP4 for streaming
+      '-movflags', '+frag_keyframe+empty_moov+default_base_moof',
+      '-f', 'mp4',
+      '-shortest',
+      '-max_muxing_queue_size', '1024'
+    ])
+    .on('error', (err) => {
+      console.error(chalk.red('  ❌ FFmpeg transcode error:'), err.message);
+      if (!res.headersSent) res.status(500).send('Error');
+    });
+  
+  proc.pipe(res, { end: true });
+  req.on('close', () => proc.kill('SIGKILL'));
+});
 
 app.get("/streamfile/:magnet/:filename", async function (req, res, next) {
   let magnet = req.params.magnet;
@@ -433,6 +726,8 @@ app.get("/streamfile/:magnet/:filename", async function (req, res, next) {
         "Content-Length": chunksize,
         "Content-Type": "video/x-matroska",
         "Cache-Control": "public, max-age=86400",
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Expose-Headers": "Content-Range, Accept-Ranges"
       });
       
       fs.createReadStream(cachedPath, { start, end }).pipe(res);
@@ -441,6 +736,8 @@ app.get("/streamfile/:magnet/:filename", async function (req, res, next) {
         "Content-Length": fileSize,
         "Content-Type": "video/x-matroska",
         "Accept-Ranges": "bytes",
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Expose-Headers": "Content-Range, Accept-Ranges"
       });
       
       fs.createReadStream(cachedPath).pipe(res);
@@ -510,10 +807,10 @@ app.get("/streamfile/:magnet/:filename", async function (req, res, next) {
 
   // 🔥 OPTIMIZED: Support both range and non-range requests
   if (!range) {
-    // No range header - send small initial chunk for instant playback
-    console.log(chalk.yellow('⚡ No range - sending optimal 512KB chunk'));
+    // No range header - send large initial chunk for immediate streaming
+    console.log(chalk.yellow('⚡ No range - sending large 20MB chunk for immediate streaming'));
     
-    // 🚀 512KB = Instant start without freezing
+    // 🚀 20MB = Large chunk for immediate streaming without buffering
     const start = 0;
     const end = Math.min(OPTIMAL_VIDEO_CHUNK, file_size - 1);
     const chunksize = end - start + 1;
@@ -543,7 +840,7 @@ app.get("/streamfile/:magnet/:filename", async function (req, res, next) {
       }
     });
     
-    console.log(chalk.cyan('✨ Initial chunk sent:'), (chunksize / 1024).toFixed(2), 'KB');
+    console.log(chalk.cyan('✨ Initial chunk sent:'), (chunksize / 1024 / 1024).toFixed(2), 'MB');
     return;
   }
 
@@ -551,24 +848,15 @@ app.get("/streamfile/:magnet/:filename", async function (req, res, next) {
   let start = parseInt(positions[0], 10);
   let end = positions[1] ? parseInt(positions[1], 10) : file_size - 1;
   
-  // 🔥 SMART CHUNK SIZE - Smaller chunks to prevent freezing
-  if (end - start > MAX_CHUNK) {
+  // 🔥 SMART CHUNK SIZE - Optimized for smooth streaming
+  const requestedSize = end - start + 1;
+  if (requestedSize > MAX_CHUNK) {
     end = start + MAX_CHUNK - 1;
+    console.log(chalk.gray(`  📦 Limiting chunk: ${(requestedSize / 1024 / 1024).toFixed(1)}MB → ${(MAX_CHUNK / 1024 / 1024).toFixed(1)}MB`));
   }
   
-  // 🚀 SMART PREFETCH - Just enough ahead for smooth playback (reduced)
-  const prefetchStart = end + 1;
-  const prefetchEnd = Math.min(prefetchStart + PREFETCH_SIZE, file_size - 1);
-  
-  // Trigger prefetch in background (non-blocking) - less aggressive
-  if (prefetchEnd > prefetchStart && Math.random() < 0.5) { // 50% chance to prefetch
-    setImmediate(() => {
-      const prefetchStream = file.createReadStream({ start: prefetchStart, end: prefetchEnd });
-      prefetchStream.on('data', () => {}); // Consume data
-      prefetchStream.on('error', () => {}); // Ignore errors
-      console.log(chalk.cyan('🔮 Prefetching next 2MB...'));
-    });
-  }
+  // No prefetching - might cause buffering issues
+  const playbackProgress = start / file_size;
   
   let chunksize = end - start + 1;
 
@@ -581,15 +869,16 @@ app.get("/streamfile/:magnet/:filename", async function (req, res, next) {
     "Accept-Ranges": "bytes",
     "Content-Length": chunksize,
     "Content-Type": "video/x-matroska",
-    // 🚀 MODERATE CACHING - Prevent freezing
-    "Cache-Control": "public, max-age=3600", // 1 hour
+    // 🚀 OPTIMIZED CACHING - Balance speed and memory
+    "Cache-Control": "public, max-age=3600, stale-while-revalidate=86400",
     "X-Content-Type-Options": "nosniff",
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Expose-Headers": "Content-Range, Accept-Ranges",
     "Connection": "keep-alive",
-    // 🔥 SMOOTH PLAYBACK HINTS
+    // 🔥 PLAYBACK OPTIMIZATION HINTS
     "X-Content-Disposition": "inline",
-    "Content-Disposition": "inline"
+    "Content-Disposition": "inline",
+    "X-Accel-Buffering": "no" // Disable proxy buffering for instant delivery
   };
 
   res.writeHead(206, head);
@@ -786,6 +1075,7 @@ import fetch from "node-fetch";
 import { promisify } from "util";
 import ffmpeg from 'fluent-ffmpeg';
 import ffmpegPath from '@ffmpeg-installer/ffmpeg';
+import crypto from 'crypto';
 
 const execAsync = promisify(exec);
 
@@ -870,28 +1160,29 @@ app.get("/stream-to-vlc", async (req, res) => {
   if (!url) {
     return res.status(400).send("URL is required");
   }
+  if (!isValidHttpUrl(url) || url.length > 2000) {
+    return res.status(400).send("Invalid URL");
+  }
   
   console.log(chalk.cyan('🎬 Launching VLC:'), url);
-  const vlcCommand = `${vlcPath} "${url}"`;
-
-  exec(vlcCommand, (error) => {
-    if (error) {
-      console.error(chalk.red('❌ VLC error:'), error.message);
-      console.log(chalk.yellow('💡 VLC kurulu değil. Kurmak için:'));
-      if (isWindows) {
-        console.log(chalk.cyan('   choco install vlc'));
-      } else if (isLinux) {
-        console.log(chalk.cyan('   sudo apt install vlc'));
-        console.log(chalk.cyan('   sudo dnf install vlc'));
-      } else {
-        console.log(chalk.cyan('   brew install --cask vlc'));
-      }
-      console.log(chalk.cyan('   https://www.videolan.org/vlc/'));
-      return res.status(500).send("Error launching VLC. VLC not installed.");
+  const proc = spawn(vlcPath, [url], { shell: false, stdio: 'ignore' });
+  proc.on('error', (error) => {
+    console.error(chalk.red('❌ VLC error:'), error.message);
+    console.log(chalk.yellow('💡 VLC kurulu değil. Kurmak için:'));
+    if (isWindows) {
+      console.log(chalk.cyan('   choco install vlc'));
+    } else if (isLinux) {
+      console.log(chalk.cyan('   sudo apt install vlc'));
+      console.log(chalk.cyan('   sudo dnf install vlc'));
+    } else {
+      console.log(chalk.cyan('   brew install --cask vlc'));
     }
-    console.log(chalk.green('✅ VLC launched successfully'));
-    res.send("VLC launched successfully");
+    console.log(chalk.cyan('   https://www.videolan.org/vlc/'));
+    return res.status(500).send("Error launching VLC. VLC not installed.");
   });
+  proc.unref();
+  console.log(chalk.green('✅ VLC launched successfully'));
+  res.send("VLC launched successfully");
 });
 
 // Stream to MPV player with automatic subtitle loading
@@ -901,32 +1192,42 @@ app.get("/stream-to-mpv", async (req, res) => {
   if (!url) {
     return res.status(400).send("URL is required");
   }
+  if (!isValidHttpUrl(url) || url.length > 2000) {
+    return res.status(400).send("Invalid URL");
+  }
   
   console.log(chalk.cyan('🎬 Launching MPV:'), url);
   
   // MPV with best settings for anime
-  const mpvCommand = `${mpvPath} "${url}" --force-window=immediate --keep-open=yes --sub-auto=all --slang=en,eng,jpn --sid=1 --profile=gpu-hq`;
-
-  exec(mpvCommand, (error) => {
-    if (error) {
-      console.error(chalk.red('❌ MPV error:'), error.message);
-      console.log(chalk.yellow('💡 MPV kurulu değil. Kurmak için:'));
-      if (isWindows) {
-        console.log(chalk.cyan('   choco install mpv'));
-        console.log(chalk.cyan('   scoop install mpv'));
-      } else if (isLinux) {
-        console.log(chalk.cyan('   sudo apt install mpv'));
-        console.log(chalk.cyan('   sudo dnf install mpv'));
-        console.log(chalk.cyan('   sudo pacman -S mpv'));
-      } else {
-        console.log(chalk.cyan('   brew install mpv'));
-      }
-      console.log(chalk.cyan('   https://mpv.io/installation/'));
-      return res.status(500).send("Error launching MPV. MPV not installed or not in PATH.");
+  const args = [
+    url,
+    '--force-window=immediate',
+    '--keep-open=yes',
+    '--sub-auto=all',
+    '--slang=en,eng,jpn',
+    '--sid=1',
+    '--profile=gpu-hq'
+  ];
+  const proc = spawn(mpvPath, args, { shell: false, stdio: 'ignore' });
+  proc.on('error', (error) => {
+    console.error(chalk.red('❌ MPV error:'), error.message);
+    console.log(chalk.yellow('💡 MPV kurulu değil. Kurmak için:'));
+    if (isWindows) {
+      console.log(chalk.cyan('   choco install mpv'));
+      console.log(chalk.cyan('   scoop install mpv'));
+    } else if (isLinux) {
+      console.log(chalk.cyan('   sudo apt install mpv'));
+      console.log(chalk.cyan('   sudo dnf install mpv'));
+      console.log(chalk.cyan('   sudo pacman -S mpv'));
+    } else {
+      console.log(chalk.cyan('   brew install mpv'));
     }
-    console.log(chalk.green('✅ MPV launched successfully'));
-    res.send("MPV launched successfully");
+    console.log(chalk.cyan('   https://mpv.io/installation/'));
+    return res.status(500).send("Error launching MPV. MPV not installed or not in PATH.");
   });
+  proc.unref();
+  console.log(chalk.green('✅ MPV launched successfully'));
+  res.send("MPV launched successfully");
 });
 /* -------------------- END VLC/MPV PLAYERS -------------------- */
 
@@ -1223,7 +1524,7 @@ app.get("/api/proxy/nyaa", async (req, res) => {
 
     console.log(chalk.cyan('Proxying request to:'), url);
     
-    const response = await fetch(url);
+    const response = await withTimeout((signal) => fetch(url, { signal }), 7000);
     const html = await response.text();
     
     res.setHeader('Content-Type', 'text/html');
@@ -1255,22 +1556,27 @@ app.get("/stream-info/:magnet/:filename", async (req, res) => {
   
   const videoPath = path.join(tor.path, videoFile.path);
   
-  // Wait for file
+  // Wait for file header and minimum data to avoid ffprobe EBML header errors
+  const MIN_DATA = Math.min(8 * 1024 * 1024, Math.floor(videoFile.length * 0.02)); // 8MB or 2%
   let retries = 0;
-  while (!fs.existsSync(videoPath) && retries < 10) {
+  while ((videoFile.downloaded < MIN_DATA || !fs.existsSync(videoPath)) && retries < 30) {
     await new Promise(resolve => setTimeout(resolve, 1000));
     retries++;
   }
   
-  if (!fs.existsSync(videoPath)) {
-    return res.status(404).json({ error: 'Video not ready' });
+  if (videoFile.downloaded < MIN_DATA || !fs.existsSync(videoPath)) {
+    return res.status(503).json({ error: 'Buffering', progress: `${(videoFile.downloaded / videoFile.length * 100).toFixed(1)}%` });
   }
   
   try {
-    // Use ffprobe to get all streams
+    console.log(chalk.cyan('  📁 Video path:'), videoPath);
+    console.log(chalk.cyan('  📊 File exists:'), fs.existsSync(videoPath));
+    
+    // Use ffprobe to get all streams (header should be present now)
     const streamInfo = await new Promise((resolve, reject) => {
       ffmpeg.ffprobe(videoPath, (err, metadata) => {
         if (err) {
+          console.error(chalk.red('  ❌ FFprobe error:'), err.message);
           reject(err);
           return;
         }
@@ -1296,7 +1602,14 @@ app.get("/stream-info/:magnet/:filename", async (req, res) => {
             title: s.tags?.title || `Subtitle ${idx + 1}`
           }));
         
+        // Get duration from format or first video stream
+        const duration = metadata.format?.duration || 
+                        metadata.streams.find(s => s.codec_type === 'video')?.duration ||
+                        metadata.streams.find(s => s.duration)?.duration ||
+                        null;
+        
         console.log(chalk.green('✅ Stream info:'));
+        console.log(chalk.cyan('  Duration:'), duration ? `${Math.floor(duration / 60)}:${String(Math.floor(duration % 60)).padStart(2, '0')}` : 'Unknown');
         console.log(chalk.cyan('  Audio streams:'), audioStreams.length);
         audioStreams.forEach((a, i) => 
           console.log(chalk.gray(`    ${i + 1}. ${a.title} (${a.language}) [${a.codec}]`))
@@ -1306,7 +1619,7 @@ app.get("/stream-info/:magnet/:filename", async (req, res) => {
           console.log(chalk.gray(`    ${i + 1}. ${s.title} (${s.language}) [${s.codec}]`))
         );
         
-        resolve({ audioStreams, subtitleStreams });
+        resolve({ audioStreams, subtitleStreams, duration });
       });
     });
     
@@ -1317,112 +1630,101 @@ app.get("/stream-info/:magnet/:filename", async (req, res) => {
   }
 });
 
-// Get specific subtitle track by ID
-app.get("/subtitle/:magnet/:filename/:trackId", async (req, res) => {
-  let magnet = req.params.magnet;
-  let filename = req.params.filename;
-  let trackId = parseInt(req.params.trackId);
-  
-  console.log(chalk.cyan('\n=== SUBTITLE TRACK REQUEST ==='));
-  console.log(chalk.yellow('🎬 Filename:'), filename);
-  console.log(chalk.yellow('📝 Track ID:'), trackId);
-  
-  let tor = await client.get(magnet);
-  if (!tor) {
-    return res.status(404).send("Torrent not found");
-  }
-  
-  const videoFile = tor.files.find(f => f.name === filename);
-  if (!videoFile || !videoFile.name.endsWith('.mkv')) {
-    return res.status(404).send("Not an MKV file");
-  }
-  
-  const videoPath = path.join(tor.path, videoFile.path);
-  
-  // Wait for file
-  let retries = 0;
-  while (!fs.existsSync(videoPath) && retries < 10) {
-    await new Promise(resolve => setTimeout(resolve, 1000));
-    retries++;
-  }
-  
-  if (!fs.existsSync(videoPath)) {
-    return res.status(404).send("Video not ready");
-  }
-  
-  try {
-    const tempDir = path.join(__dirname, 'temp_subs');
-    if (!fs.existsSync(tempDir)) {
-      fs.mkdirSync(tempDir, { recursive: true });
-    }
-    
-    const baseName = filename.replace(/\.[^/.]+$/, '');
-    const subtitleOutputPath = path.join(tempDir, `${baseName}_track${trackId}.srt`);
-    
-    console.log(chalk.cyan('🎬 Extracting subtitle track'), trackId, chalk.gray('from MKV'));
-    
-    // Extract specific track using FFmpeg
-    await new Promise((resolve, reject) => {
-      ffmpeg(videoPath)
-        .outputOptions([
-          `-map 0:s:${trackId}`,  // Specific subtitle stream
-          '-c:s srt',             // Convert to SRT
-          '-y'                    // Overwrite
-        ])
-        .output(subtitleOutputPath)
-        .on('end', () => {
-          console.log(chalk.green('✅ Track'), trackId, chalk.green('extracted'));
-          resolve();
-        })
-        .on('error', (err) => {
-          console.error(chalk.red('❌ FFmpeg error:'), err.message);
-          reject(err);
-        })
-        .run();
-    });
-    
-    if (fs.existsSync(subtitleOutputPath)) {
-      const srtContent = fs.readFileSync(subtitleOutputPath, 'utf-8');
-      const vttContent = convertSRTtoVTT(srtContent);
-      
-      res.setHeader("Content-Type", "text/vtt");
-      res.setHeader("Access-Control-Allow-Origin", "*");
-      res.send(vttContent);
-      
-      // Cleanup after 5 minutes
-      setTimeout(() => {
-        try {
-          if (fs.existsSync(subtitleOutputPath)) {
-            fs.unlinkSync(subtitleOutputPath);
-          }
-        } catch (err) {
-          console.error(chalk.red('Cleanup error:'), err);
-        }
-      }, 5 * 60 * 1000);
-    } else {
-      res.status(404).send("Subtitle track not found");
-    }
-  } catch (error) {
-    console.error(chalk.red('❌ Error extracting subtitle:'), error.message);
-    res.status(500).send("Error extracting subtitle");
-  }
-});
-
-// Get SPECIFIC subtitle track by ID from MKV
+// Get specific subtitle track by ID (CACHED - Extract once, serve many times)
 app.get("/subtitle/:magnet/:filename/:trackId", async (req, res) => {
   let magnet = req.params.magnet;
   let filename = decodeURIComponent(req.params.filename);
   let trackId = parseInt(req.params.trackId);
   
-  console.log(chalk.cyan('\n=== SPECIFIC SUBTITLE TRACK REQUEST ==='));
+  // Create cache key for this specific track
+  const cacheKey = `${magnet}_${filename}_track${trackId}`;
+  
+  console.log(chalk.cyan('\n=== 📝 SUBTITLE REQUEST ==='));
   console.log(chalk.yellow('  File:'), filename);
-  console.log(chalk.yellow('  Track ID:'), trackId);
+  console.log(chalk.yellow('  Track:'), trackId);
+  console.log(chalk.gray('  Request from:'), req.get('origin') || req.get('referer') || 'direct');
+  
+  // Persistent on-disk cache for extracted WebVTT
+  // Use shorter hashed filenames to avoid Windows MAX_PATH issues
+  const cacheKeyRaw = `${magnet}|${filename}|track:${trackId}`;
+  const safeBase = crypto.createHash('sha1').update(cacheKeyRaw).digest('hex');
+  const subsCacheDir = path.join(__dirname, 'temp_subs');
+  const cachedVttPath = path.join(subsCacheDir, `${safeBase}.vtt`);
+  try {
+    if (fs.existsSync(cachedVttPath)) {
+      console.log(chalk.green('📝 Serving cached subtitle:'), cachedVttPath);
+      res.setHeader('Content-Type', 'text/vtt; charset=utf-8');
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Cache-Control', 'public, max-age=86400, immutable');
+      return fs.createReadStream(cachedVttPath).pipe(res);
+    }
+  } catch {}
   
   let tor = await client.get(magnet);
   if (!tor) {
     return res.status(404).send('Torrent not found');
   }
   
+  // STRATEGY 1: Check if torrent has standalone subtitle files (.srt, .ass)
+  console.log(chalk.cyan('  🔍 Searching for standalone subtitle files in torrent...'));
+  const standaloneSubFiles = tor.files.filter(f => 
+    (f.name.endsWith('.srt') || f.name.endsWith('.ass')) &&
+    f.name.toLowerCase().includes(path.parse(filename).name.toLowerCase().substring(0, 20))
+  );
+  
+  if (standaloneSubFiles.length > 0) {
+    console.log(chalk.green(`  ✅ Found ${standaloneSubFiles.length} standalone subtitle file(s)!`));
+    const subFile = standaloneSubFiles[trackId] || standaloneSubFiles[0];
+    console.log(chalk.cyan(`  📥 Downloading subtitle file: ${subFile.name}`));
+    
+    // Select ONLY this subtitle file for download (fast!)
+    tor.files.forEach(f => f.deselect());
+    subFile.select();
+    
+    const subPath = path.join(tor.path, subFile.path);
+    
+    // Wait for subtitle file to download (usually very small, <1MB)
+    let retries = 0;
+    while (subFile.downloaded < subFile.length && retries < 30) {
+      await new Promise(resolve => setTimeout(resolve, 500));
+      retries++;
+      if (retries % 5 === 0) {
+        const progress = ((subFile.downloaded / subFile.length) * 100).toFixed(1);
+        console.log(chalk.cyan(`     Subtitle download: ${progress}%`));
+      }
+    }
+    
+    if (subFile.downloaded >= subFile.length && fs.existsSync(subPath)) {
+      console.log(chalk.green('  ✅ Standalone subtitle file downloaded!'));
+      let subContent = fs.readFileSync(subPath, 'utf8');
+      const isAss = subFile.name.endsWith('.ass');
+      const isSrt = subFile.name.endsWith('.srt');
+      
+      let vttContent;
+      if (isAss) {
+        // ASS to VTT: Extract dialogue lines only (simplified conversion)
+        console.log(chalk.cyan('  🔄 Converting ASS to VTT...'));
+        vttContent = convertASStoVTT(subContent);
+      } else if (isSrt) {
+        console.log(chalk.cyan('  🔄 Converting SRT to VTT...'));
+        vttContent = convertSRTtoVTT(subContent);
+      } else {
+        vttContent = subContent; // Assume it's already VTT or plain text
+      }
+      
+      fs.writeFileSync(cachedVttPath, vttContent, 'utf8');
+      
+      res.setHeader('Content-Type', 'text/vtt; charset=utf-8');
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Cache-Control', 'public, max-age=86400, immutable');
+      return res.send(vttContent);
+    }
+    
+    console.log(chalk.yellow('  ⚠️ Standalone subtitle download timeout, falling back to MKV extraction'));
+  }
+  
+  // STRATEGY 2: Extract from MKV (fallback)
+  console.log(chalk.cyan('  🎬 Extracting subtitle from MKV file...'));
   const videoFile = tor.files.find(f => f.name === filename);
   if (!videoFile || !videoFile.name.endsWith('.mkv')) {
     return res.status(404).send('Not an MKV file');
@@ -1430,98 +1732,162 @@ app.get("/subtitle/:magnet/:filename/:trackId", async (req, res) => {
   
   const videoPath = path.join(tor.path, videoFile.path);
   
-  // Wait for file
-  let retries = 0;
-  while (!fs.existsSync(videoPath) && retries < 10) {
-    await new Promise(resolve => setTimeout(resolve, 1000));
-    retries++;
-  }
+  // Check if file is fully cached in downloads folder (100% complete)
+  const downloadsDir = path.join(__dirname, 'downloads');
+  const cachedFilePath = path.join(downloadsDir, filename);
+  const isFullyCached = fs.existsSync(cachedFilePath);
   
-  if (!fs.existsSync(videoPath)) {
-    return res.status(404).send('Video not ready');
-  }
-  
-  try {
-    const tempDir = path.join(__dirname, 'temp_subs');
-    if (!fs.existsSync(tempDir)) {
-      fs.mkdirSync(tempDir, { recursive: true });
-    }
+  if (isFullyCached) {
+    console.log(chalk.green(`  ✅ CACHED FILE - Complete subtitles guaranteed!`));
+    // Use cached file - guaranteed to have ALL subtitles
+  } else if (videoFile.downloaded >= videoFile.length * 0.95) {
+    // 95% or more downloaded - close enough for complete subs
+    console.log(chalk.green(`  ✅ File 95%+ complete - extracting full subtitles`));
+  } else {
+    // STREAMING: Force complete MKV download in background, use smart strategy
+    console.log(chalk.yellow(`  ⚡ Smart subtitle extraction strategy...`));
     
-    const baseName = filename.replace(/\.[^/.]+$/, '');
-    const subtitleOutputPath = path.join(tempDir, `${baseName}_track${trackId}.srt`);
-    
-    console.log(chalk.cyan('  Extracting subtitle track'), trackId, 'from MKV');
-    
-    // Extract specific track using FFmpeg
-    await new Promise((resolve, reject) => {
-      ffmpeg(videoPath)
-        .outputOptions([
-          `-map 0:s:${trackId}`,  // Specific subtitle stream by ID
-          '-c:s srt',
-          '-y'
-        ])
-        .output(subtitleOutputPath)
-        .on('end', () => {
-          console.log(chalk.green('  ✅ Track'), trackId, 'extracted');
-          resolve();
-        })
-        .on('error', (err) => {
-          console.error(chalk.red('  ❌ Extraction failed:'), err.message);
-          reject(err);
-        })
-        .run();
+    // Select video file for download
+    tor.files.forEach(f => {
+      if (f.name === filename) {
+        f.select();
+      }
     });
     
-    if (fs.existsSync(subtitleOutputPath)) {
-      const srtContent = fs.readFileSync(subtitleOutputPath, 'utf-8');
-      const vttContent = convertSRTtoVTT(srtContent);
+    // MKV subtitles are usually at the BEGINNING of file
+    // Wait for first 10-15% which usually contains ALL subtitle metadata
+    const SMART_THRESHOLD = Math.min(200 * 1024 * 1024, Math.floor(videoFile.length * 0.15)); // 200MB or 15%
+    
+    const totalSizeMB = (videoFile.length / (1024*1024)).toFixed(1);
+    const neededMB = (SMART_THRESHOLD / (1024*1024)).toFixed(1);
+    
+    console.log(chalk.cyan(`  📥 Downloading smart range: ${neededMB} MB / ${totalSizeMB} MB (15%)`));
+    console.log(chalk.gray(`     MKV subtitle data is usually in first 10-15% of file`));
+    
+    let retries = 0;
+    let lastLoggedPercent = 0;
+    
+    while (videoFile.downloaded < SMART_THRESHOLD && retries < 120) {
+      await new Promise(resolve => setTimeout(resolve, 500));
+      retries++;
       
-      res.setHeader('Content-Type', 'text/vtt');
-      res.setHeader('Access-Control-Allow-Origin', '*');
-      res.send(vttContent);
-      
-      // Cleanup after 5 minutes
-      setTimeout(() => {
-        try {
-          if (fs.existsSync(subtitleOutputPath)) {
-            fs.unlinkSync(subtitleOutputPath);
-          }
-        } catch (err) {
-          console.error(chalk.red('Cleanup error:'), err);
-        }
-      }, 5 * 60 * 1000);
-    } else {
-      res.status(404).send('Subtitle track not found');
+      const currentPercent = Math.floor((videoFile.downloaded / SMART_THRESHOLD) * 100);
+      if (currentPercent >= lastLoggedPercent + 20) {
+        const downloadedMB = (videoFile.downloaded / (1024*1024)).toFixed(1);
+        console.log(chalk.cyan(`     📊 ${currentPercent}% (${downloadedMB} MB)`));
+        lastLoggedPercent = currentPercent;
+      }
     }
+    
+    if (videoFile.downloaded >= SMART_THRESHOLD || videoFile.downloaded >= videoFile.length) {
+      const downloadPercent = ((videoFile.downloaded / videoFile.length) * 100).toFixed(1);
+      console.log(chalk.green(`  ✅ Downloaded ${downloadPercent}% - extracting subtitles...`));
+      
+      // Continue downloading in background for complete file
+      console.log(chalk.gray(`  📥 Continuing full download in background...`));
+    } else {
+      const downloadedMB = (videoFile.downloaded / (1024*1024)).toFixed(1);
+      console.log(chalk.yellow(`  ⚠️ Downloaded ${downloadedMB} MB - extracting available subtitles`));
+    }
+  }
+  
+  // Use cached file if available, otherwise use streaming path
+  const extractPath = isFullyCached ? cachedFilePath : videoPath;
+  
+  try {
+    console.log(chalk.cyan(`  🎬 Extracting subtitle track ${trackId} to cache...`));
+    if (!fs.existsSync(subsCacheDir)) fs.mkdirSync(subsCacheDir, { recursive: true });
+    let responded = false;
+    
+    // Try SRT first (most compatible), then convert to VTT
+    const tempSrtPath = path.join(subsCacheDir, `${safeBase}.srt`);
+    const srtProc = ffmpeg(extractPath) // Use cached file if available
+      .inputOptions(['-analyzeduration','10M','-probesize','10M','-nostdin'])
+      .outputOptions([`-map 0:s:${trackId}`,'-c:s','srt','-f','srt'])
+      .on('error', (err) => {
+        console.error(chalk.red('  ❌ SRT extract failed:'), err.message);
+        try { if (fs.existsSync(tempSrtPath)) fs.unlinkSync(tempSrtPath); } catch {}
+        if (responded || res.headersSent) return;
+        
+        // Final fallback: try direct WebVTT
+        console.log(chalk.yellow('  🔄 Trying direct WebVTT extraction...'));
+        const vttProc = ffmpeg(extractPath) // Use cached file if available
+          .inputOptions(['-analyzeduration','10M','-probesize','10M','-nostdin'])
+          .outputOptions([`-map 0:s:${trackId}`,'-c:s','webvtt','-f','webvtt'])
+          .on('error', () => {
+            if (responded || res.headersSent) return;
+            responded = true;
+            res.status(404).send('Subtitle track not convertible');
+          })
+          .on('end', () => {
+            if (responded || res.headersSent) return;
+            console.log(chalk.green('  ✅ WebVTT subtitle cached'));
+            responded = true;
+            res.setHeader('Content-Type', 'text/vtt; charset=utf-8');
+            res.setHeader('Access-Control-Allow-Origin', '*');
+            res.setHeader('Cache-Control', 'public, max-age=86400, immutable');
+            fs.createReadStream(cachedVttPath).pipe(res);
+          })
+          .save(cachedVttPath);
+      })
+      .on('end', () => {
+        if (responded || res.headersSent) return;
+        try {
+          console.log(chalk.green('  ✅ SRT extracted, converting to VTT...'));
+          const srtContent = fs.readFileSync(tempSrtPath, 'utf8');
+          const vttContent = convertSRTtoVTT(srtContent);
+          fs.writeFileSync(cachedVttPath, vttContent, 'utf8');
+          try { fs.unlinkSync(tempSrtPath); } catch {}
+          
+          console.log(chalk.green('  ✅ VTT conversion complete'));
+          responded = true;
+          res.setHeader('Content-Type', 'text/vtt; charset=utf-8');
+          res.setHeader('Access-Control-Allow-Origin', '*');
+          res.setHeader('Cache-Control', 'public, max-age=86400, immutable');
+          fs.createReadStream(cachedVttPath).pipe(res);
+        } catch (convErr) {
+          console.error(chalk.red('  ❌ VTT conversion failed:'), convErr.message);
+          if (!res.headersSent) {
+            responded = true;
+            res.status(500).send('Subtitle conversion failed');
+          }
+        }
+      })
+      .save(tempSrtPath);
   } catch (error) {
-    console.error(chalk.red('❌ Error extracting subtitle:'), error.message);
-    res.status(500).send('Error extracting subtitle');
+    console.error(chalk.red('  ❌ Error:'), error.message);
+    if (!res.headersSent) res.status(500).send('Error processing subtitle request');
   }
 });
 
-// 💾 Subtitle cache - Store extracted subtitles in memory with LRU eviction
+// Duplicate endpoint removed - using cached version above
+
+// 💾 Subtitle cache - Store extracted subtitles permanently (never delete)
 class SubtitleCache {
-  constructor(maxSize = 50) {
+  constructor() {
     this.cache = new Map();
-    this.maxSize = maxSize;
+    this.stats = {
+      totalStored: 0,
+      totalHits: 0,
+      totalMisses: 0
+    };
   }
   
   get(key) {
     const item = this.cache.get(key);
     if (item) {
-      // Move to end (most recently used)
-      this.cache.delete(key);
-      this.cache.set(key, item);
+      this.stats.totalHits++;
+      console.log(chalk.green(`📊 Cache hit for: ${key}`));
+      return item;
     }
-    return item;
+    this.stats.totalMisses++;
+    return null;
   }
   
   set(key, value) {
-    // Remove oldest if at capacity
-    if (this.cache.size >= this.maxSize) {
-      const firstKey = this.cache.keys().next().value;
-      this.cache.delete(firstKey);
-      console.log(chalk.gray('🗑️ Evicted old subtitle from cache'));
+    if (!this.cache.has(key)) {
+      this.stats.totalStored++;
+      console.log(chalk.blue(`💾 Storing subtitle permanently: ${key}`));
     }
     this.cache.set(key, value);
   }
@@ -1529,25 +1895,51 @@ class SubtitleCache {
   has(key) {
     return this.cache.has(key);
   }
+  
+  getStats() {
+    return {
+      ...this.stats,
+      currentSize: this.cache.size,
+      hitRate: this.stats.totalHits / (this.stats.totalHits + this.stats.totalMisses) * 100 || 0
+    };
+  }
+  
+  // Method to manually clear cache if needed (for debugging)
+  clear() {
+    console.log(chalk.yellow('🧹 Manually clearing subtitle cache'));
+    this.cache.clear();
+    this.stats = { totalStored: 0, totalHits: 0, totalMisses: 0 };
+  }
 }
 
-const subtitleCache = new SubtitleCache(20); // 🔥 KOYEB: Reduced to 20 for RAM savings
+const subtitleCache = new SubtitleCache(); // 🔥 Permanent subtitle cache - never deletes
+
+// Cache statistics endpoint
+app.get("/cache-stats", (req, res) => {
+  const stats = subtitleCache.getStats();
+  res.json({
+    subtitleCache: {
+      ...stats,
+      keys: Array.from(subtitleCache.cache.keys()),
+      description: "Permanent subtitle cache - never deletes subtitles"
+    }
+  });
+});
+
+// Manual cache clear endpoint (for debugging only)
+app.post("/cache-clear", (req, res) => {
+  subtitleCache.clear();
+  res.json({ message: "Subtitle cache cleared manually" });
+});
 
 // Get subtitle for a specific file (extract from MKV if needed) - DEFAULT TRACK
 app.get("/subtitles/:magnet/:filename", async (req, res) => {
   const cacheKey = `${req.params.magnet}_${req.params.filename}`;
   
-  // 🔥 CHECK CACHE FIRST - Instant delivery!
-  if (subtitleCache.has(cacheKey)) {
-    console.log(chalk.green('⚡ SUBTITLE CACHE HIT - Instant delivery!'));
-    const cached = subtitleCache.get(cacheKey);
-    res.setHeader("Content-Type", "text/vtt");
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Expose-Headers", "X-Subtitle-Type");
-    res.setHeader("X-Subtitle-Type", cached.type);
-    res.setHeader("Cache-Control", "public, max-age=86400, immutable"); // 1 day cache
-    return res.send(cached.content);
-  }
+  // Persistent on-disk cache for default track
+  const safeBase = crypto.createHash('sha1').update(cacheKey).digest('hex');
+  const subsCacheDir = path.join(__dirname, 'temp_subs');
+  const cachedVttPath = path.join(subsCacheDir, `${safeBase}_default.vtt`);
   let magnet = req.params.magnet;
   let filename = req.params.filename;
 
@@ -1597,7 +1989,7 @@ app.get("/subtitles/:magnet/:filename", async (req, res) => {
   allFiles.forEach((f, i) => console.log(chalk.gray(`  ${i + 1}. ${f}`)));
   console.log(chalk.yellow('🎯 Subtitle file found:'), subtitleFile?.name || chalk.red('NONE - Will extract from MKV'));
   
-  // 2. If external subtitle found, stream it
+  // 2. If external subtitle found, stream it and also cache
   if (subtitleFile) {
     console.log(chalk.cyan('📝 Streaming external subtitle:'), subtitleFile.name);
     
@@ -1625,9 +2017,15 @@ app.get("/subtitles/:magnet/:filename", async (req, res) => {
         subtitleContent = Buffer.concat(chunks).toString();
         subtitleCache.set(cacheKey, {
           content: subtitleContent,
-          type: isAssFile ? 'ass' : 'srt'
+          type: isAssFile ? 'ass' : 'srt',
+          extractedAt: Date.now()
         });
-        console.log(chalk.cyan('💾 Subtitle cached for instant future access'));
+        try {
+          if (!fs.existsSync(subsCacheDir)) fs.mkdirSync(subsCacheDir, { recursive: true });
+          const vttContent = isAssFile ? subtitleContent : convertSRTtoVTT(subtitleContent);
+          fs.writeFileSync(cachedVttPath, vttContent, 'utf-8');
+        } catch {}
+        console.log(chalk.cyan('💾 Subtitle stored permanently - will never be deleted'));
         res.end();
       });
       
@@ -1770,7 +2168,7 @@ app.get("/subtitles/:magnet/:filename", async (req, res) => {
     }
   }
   
-  // 5. Last resort: try to extract from MKV
+  // 5. Last resort: try to extract from MKV and persist to disk
   const videoFile = tor.files.find(f => f.name === filename);
   
   if (!videoFile || !videoFile.name.endsWith('.mkv')) {
@@ -1836,68 +2234,219 @@ app.get("/subtitles/:magnet/:filename", async (req, res) => {
       console.log(chalk.yellow('⚠️ Could not detect subtitle format:'), err.message);
     }
 
-    // 🚀 DIREKT STREAM - FFmpeg extraction yok, çok daha hızlı!
-    console.log(chalk.cyan('🎬 Streaming subtitle directly from MKV (no extraction)...'));
-    
-    res.setHeader("Content-Type", "text/vtt");
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Expose-Headers", "X-Subtitle-Type");
-    res.setHeader("X-Subtitle-Type", isAssSubtitle ? "ass" : "srt");
-    res.setHeader("Cache-Control", "public, max-age=86400, immutable");
-    
-    // Direkt stream - Track 5'i dene, yoksa Track 0
-    const trackToTry = 4; // Track 5 (0-indexed)
-    
-    console.log(chalk.yellow(`  Trying Track ${trackToTry + 1} (0:s:${trackToTry})`));
-    
-    const subtitleStream = ffmpeg(videoPath)
-      .outputOptions([
-        `-map 0:s:${trackToTry}`,
-        '-f webvtt',  // Direkt WebVTT formatında
-        '-'           // stdout'a yaz
-      ])
-      .on('start', (cmd) => {
-        console.log(chalk.gray('  FFmpeg stream command:'), cmd);
-      })
+    console.log(chalk.cyan('🎬 Extracting subtitle to cache (WebVTT)'));
+    if (!fs.existsSync(subsCacheDir)) fs.mkdirSync(subsCacheDir, { recursive: true });
+    const proc = ffmpeg(videoPath)
+      .outputOptions(['-map 0:s:0','-c:s','webvtt','-f','webvtt'])
       .on('error', (err) => {
-        console.log(chalk.yellow(`  ⚠️ Track ${trackToTry + 1} failed, trying Track 1...`));
-        
-        // Fallback: Track 0
-        const fallbackStream = ffmpeg(videoPath)
-          .outputOptions([
-            '-map 0:s:0',
-            '-f webvtt',
-            '-'
-          ])
-          .on('start', (cmd) => {
-            console.log(chalk.gray('  Fallback command:'), cmd);
+        console.error(chalk.red('❌ FFmpeg error:'), err.message);
+        if (fs.existsSync(cachedVttPath)) fs.unlinkSync(cachedVttPath);
+        // Fallback: extract SRT to temp file then convert
+        const tempSrtPath = path.join(subsCacheDir, `${safeBase}_default.srt`);
+        const srtProc = ffmpeg(videoPath)
+          .outputOptions(['-map 0:s:0','-c:s','srt','-f','srt'])
+          .on('error', () => {
+            if (!res.headersSent) res.status(404).send('No subtitle track found in MKV');
           })
-          .on('error', (fallbackErr) => {
-            console.error(chalk.red('  ❌ No subtitle track found'));
-            if (!res.headersSent) {
-              res.status(404).send('No subtitle track found in MKV');
+          .on('end', () => {
+            try {
+              const srtContent = fs.readFileSync(tempSrtPath, 'utf8');
+              const vttContent = convertSRTtoVTT(srtContent);
+              fs.writeFileSync(cachedVttPath, vttContent, 'utf8');
+              try { fs.unlinkSync(tempSrtPath); } catch {}
+              res.setHeader('Content-Type', 'text/vtt');
+              res.setHeader('Access-Control-Allow-Origin', '*');
+              res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+              fs.createReadStream(cachedVttPath).pipe(res);
+            } catch {
+              if (!res.headersSent) res.status(500).send('Subtitle conversion failed');
             }
-          });
-        
-        fallbackStream.pipe(res);
-        console.log(chalk.green('✅ Subtitle streaming (fallback)'));
-        return;
-      });
-    
-    subtitleStream.pipe(res);
-    console.log(chalk.green('✅ Subtitle streaming directly from MKV'));
+          })
+          .save(tempSrtPath);
+      })
+      .on('end', () => {
+        console.log(chalk.green('✅ Subtitle cached, serving...'));
+        res.setHeader('Content-Type', 'text/vtt');
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+        fs.createReadStream(cachedVttPath).pipe(res);
+      })
+      .save(cachedVttPath);
   } catch (error) {
     console.error(chalk.red('❌ FFmpeg error:'), error.message);
     return res.status(500).send("Error extracting subtitle from MKV");
   }
 });
 
-// Helper function to convert SRT to WebVTT
+// Background re-extraction when file is fully downloaded
+async function checkAndReExtractSubtitles(magnet, filename, trackId, safeBase, cachedVttPath, subsCacheDir) {
+  try {
+    const tor = await client.get(magnet);
+    if (!tor) return;
+    
+    const videoFile = tor.files.find(f => f.name === filename);
+    if (!videoFile) return;
+    
+    // Check if file is now fully downloaded
+    const isComplete = videoFile.downloaded >= videoFile.length;
+    const downloadPercent = ((videoFile.downloaded / videoFile.length) * 100).toFixed(1);
+    
+    if (isComplete) {
+      console.log(chalk.green(`\n🔄 File fully downloaded (${downloadPercent}%) - re-extracting complete subtitles...`));
+      console.log(chalk.cyan(`   File: ${filename} Track: ${trackId}`));
+      
+      const videoPath = path.join(tor.path, videoFile.path);
+      if (!fs.existsSync(videoPath)) return;
+      
+      // Re-extract with full file
+      const tempSrtPath = path.join(subsCacheDir, `${safeBase}_full.srt`);
+      
+      ffmpeg(videoPath)
+        .inputOptions(['-analyzeduration','10M','-probesize','10M','-nostdin'])
+        .outputOptions([`-map 0:s:${trackId}`,'-c:s','srt','-f','srt'])
+        .on('error', (err) => {
+          console.error(chalk.red('  ❌ Background re-extraction failed:'), err.message);
+        })
+        .on('end', () => {
+          try {
+            const srtContent = fs.readFileSync(tempSrtPath, 'utf8');
+            const vttContent = convertSRTtoVTT(srtContent);
+            
+            // Replace cached VTT with complete version
+            fs.writeFileSync(cachedVttPath, vttContent, 'utf8');
+            fs.unlinkSync(tempSrtPath); // Clean up temp SRT
+            
+            const cueCount = (vttContent.match(/-->/g) || []).length;
+            console.log(chalk.green(`  ✅ Complete subtitles cached: ${cueCount} cues (updated cache)`));
+          } catch (e) {
+            console.error(chalk.red('  ❌ VTT conversion failed:'), e.message);
+          }
+        })
+        .save(tempSrtPath);
+        
+    } else if (downloadPercent < 100) {
+      // Not complete yet, check again later
+      console.log(chalk.gray(`  ⏳ Download progress: ${downloadPercent}% - will check again...`));
+      setTimeout(() => {
+        checkAndReExtractSubtitles(magnet, filename, trackId, safeBase, cachedVttPath, subsCacheDir);
+      }, 10000); // Check every 10 seconds
+    }
+  } catch (err) {
+    console.error(chalk.red('Background re-extraction error:'), err.message);
+  }
+}
+
+// Helper function to convert ASS to WebVTT (simplified - strips styling)
+function convertASStoVTT(assContent) {
+  if (!assContent || assContent.trim().length === 0) {
+    return 'WEBVTT\n\n';
+  }
+  
+  let vtt = 'WEBVTT\n\n';
+  const lines = assContent.split(/\r?\n/);
+  let inEvents = false;
+  
+  for (let line of lines) {
+    // Find [Events] section
+    if (line.trim() === '[Events]') {
+      inEvents = true;
+      continue;
+    }
+    
+    // Stop if we hit another section
+    if (line.trim().startsWith('[') && line.trim() !== '[Events]') {
+      inEvents = false;
+      continue;
+    }
+    
+    if (!inEvents || !line.startsWith('Dialogue:')) continue;
+    
+    // Parse ASS dialogue line
+    // Format: Dialogue: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
+    const parts = line.substring(9).split(','); // Remove "Dialogue:"
+    if (parts.length < 10) continue;
+    
+    const start = parts[1].trim();
+    const end = parts[2].trim();
+    const text = parts.slice(9).join(','); // Text might contain commas
+    
+    // Convert ASS timestamp (0:00:01.50) to VTT (00:00:01.500)
+    const vttStart = convertASSTimestamp(start);
+    const vttEnd = convertASSTimestamp(end);
+    
+    // Strip ASS formatting tags like {\b1}, {\i1}, etc
+    const cleanText = text.replace(/\{[^}]*\}/g, '').replace(/\\N/g, '\n').trim();
+    
+    if (cleanText) {
+      vtt += `${vttStart} --> ${vttEnd}\n`;
+      vtt += cleanText + '\n\n';
+    }
+  }
+  
+  return vtt;
+}
+
+function convertASSTimestamp(assTime) {
+  // ASS: 0:00:01.50 → VTT: 00:00:01.500
+  const parts = assTime.split(':');
+  if (parts.length !== 3) return '00:00:00.000';
+  
+  const hours = parts[0].padStart(2, '0');
+  const minutes = parts[1].padStart(2, '0');
+  const secParts = parts[2].split('.');
+  const seconds = secParts[0].padStart(2, '0');
+  const centiseconds = (secParts[1] || '0').padEnd(3, '0').substring(0, 3); // Convert centiseconds to milliseconds
+  
+  return `${hours}:${minutes}:${seconds}.${centiseconds}`;
+}
+
+// Helper function to convert SRT to WebVTT (PROPER CONVERSION)
 function convertSRTtoVTT(srtContent) {
+  if (!srtContent || srtContent.trim().length === 0) {
+    return 'WEBVTT\n\n';
+  }
+  
+  // Start with WebVTT header
   let vtt = 'WEBVTT\n\n';
   
-  // Replace comma with dot in timestamps (SRT uses comma, VTT uses dot)
-  vtt += srtContent.replace(/,/g, '.');
+  // Split into blocks (separated by double newlines)
+  const blocks = srtContent.split(/\r?\n\r?\n/);
+  
+  for (let block of blocks) {
+    if (!block.trim()) continue;
+    
+    const lines = block.split(/\r?\n/);
+    if (lines.length < 2) continue;
+    
+    // First line is sequence number in SRT - SKIP IT (VTT doesn't use numbers)
+    // Second line is timestamp
+    // Rest are subtitle text
+    
+    let startIdx = 0;
+    
+    // Skip sequence number line (if it's just a number)
+    if (lines[0].match(/^\d+$/)) {
+      startIdx = 1;
+    }
+    
+    if (startIdx >= lines.length) continue;
+    
+    // Get timestamp line
+    const timestampLine = lines[startIdx];
+    
+    // Convert SRT timestamp format to VTT format
+    // SRT: 00:00:01,500 --> 00:00:04,400
+    // VTT: 00:00:01.500 --> 00:00:04.400
+    const vttTimestamp = timestampLine.replace(/,/g, '.');
+    
+    // Get subtitle text (all remaining lines)
+    const subtitleText = lines.slice(startIdx + 1).join('\n');
+    
+    if (subtitleText.trim()) {
+      vtt += vttTimestamp + '\n';
+      vtt += subtitleText + '\n\n';
+    }
+  }
   
   return vtt;
 }
@@ -2078,96 +2627,132 @@ app.get("/local-subtitle/:episode/:subtitleId?", async (req, res) => {
 });
 /* ======================================================== */
 
-/* ========== GET AUDIO TRACKS FROM MKV ========== */
-// Get all audio and subtitle tracks from MKV file
+/* ========== GET AUDIO TRACKS FROM MKV (IMPROVED) ========== */
+// Helper function to map language codes to full names
+// Removed getLanguageName function - no longer needed for fast track detection
+
+// Get audio and subtitle tracks from MKV file with REAL codec detection
 app.get("/tracks/:magnet/:filename", async (req, res) => {
   let magnet = req.params.magnet;
-  let filename = req.params.filename;
+  let filename = decodeURIComponent(req.params.filename);
   
-  console.log(chalk.cyan('\n=== TRACK INFO REQUEST ==='));
-  console.log(chalk.yellow('🎬 Filename:'), filename);
+  console.log(chalk.cyan('\n=== 🎬 TRACK DETECTION (WITH CODEC INFO) ==='));
+  console.log(chalk.yellow('  File:'), filename);
   
   let tor = await client.get(magnet);
   if (!tor) {
-    return res.status(404).send("Torrent not found");
+    return res.status(404).json({ error: 'Torrent not found', audio: [], subtitles: [] });
   }
   
   const videoFile = tor.files.find(f => f.name === filename);
-  if (!videoFile || !videoFile.name.endsWith('.mkv')) {
-    return res.status(404).send("Not an MKV file");
+  if (!videoFile) {
+    return res.status(404).json({ error: 'File not found', audio: [], subtitles: [] });
+  }
+  
+  if (!videoFile.name.endsWith('.mkv')) {
+    console.log(chalk.yellow('  ⚠️ Not an MKV file, returning empty tracks'));
+    return res.json({ audio: [], subtitles: [] });
   }
   
   const videoPath = path.join(tor.path, videoFile.path);
   
-  // Wait for file to be available
+  // Wait for sufficient data (20MB or 3%)
+  const MIN_DATA = Math.min(20 * 1024 * 1024, Math.floor(videoFile.length * 0.03));
   let retries = 0;
-  while (!fs.existsSync(videoPath) && retries < 10) {
+  while ((videoFile.downloaded < MIN_DATA || !fs.existsSync(videoPath)) && retries < 30) {
     await new Promise(resolve => setTimeout(resolve, 1000));
     retries++;
   }
   
-  if (!fs.existsSync(videoPath)) {
-    return res.status(404).json({ error: 'Video file not ready' });
+  if (videoFile.downloaded < MIN_DATA || !fs.existsSync(videoPath)) {
+    console.log(chalk.yellow('  ⏳ Buffering, not enough data yet'));
+    return res.json({ 
+      ready: false, 
+      progress: `${(videoFile.downloaded / videoFile.length * 100).toFixed(1)}%`,
+      audio: [], 
+      subtitles: [] 
+    });
   }
   
+  // Use FFmpeg to get REAL codec information
   try {
-    // Use ffprobe to get all tracks
+    console.log(chalk.cyan('  🔍 Analyzing with FFmpeg...'));
     const trackInfo = await new Promise((resolve, reject) => {
       ffmpeg.ffprobe(videoPath, (err, metadata) => {
         if (err) {
-          console.error(chalk.red('❌ FFprobe error:'), err.message);
+          console.error(chalk.red('  ❌ FFprobe error:'), err.message);
           reject(err);
           return;
         }
         
-        console.log(chalk.cyan('🔍 Analyzing MKV tracks...'));
-        
-        // Extract audio tracks
-        const audioTracks = metadata.streams
+        const audioStreams = metadata.streams
           .filter(s => s.codec_type === 'audio')
           .map((s, idx) => ({
             index: idx,
             streamIndex: s.index,
-            codec: s.codec_name,
-            language: s.tags?.language || s.tags?.title || 'Unknown',
+            codec: s.codec_name || 'unknown',
+            language: s.tags?.language || 'und',
+            languageName: s.tags?.language || 'Unknown',
             title: s.tags?.title || `Audio ${idx + 1}`,
-            channels: s.channels,
-            default: s.disposition?.default === 1
+            channels: s.channels || 2,
+            default: s.disposition?.default === 1 || idx === 0,
+            forced: s.disposition?.forced === 1 || false
           }));
         
-        // Extract subtitle tracks
-        const subtitleTracks = metadata.streams
+        const subtitleStreams = metadata.streams
           .filter(s => s.codec_type === 'subtitle')
           .map((s, idx) => ({
             index: idx,
             streamIndex: s.index,
-            codec: s.codec_name,
-            language: s.tags?.language || s.tags?.title || 'Unknown',
+            codec: s.codec_name || 'unknown',
+            language: s.tags?.language || 'und',
+            languageName: s.tags?.language || 'Unknown',
             title: s.tags?.title || `Subtitle ${idx + 1}`,
-            default: s.disposition?.default === 1
+            default: s.disposition?.default === 1 || idx === 0,
+            forced: s.disposition?.forced === 1 || false
           }));
         
-        console.log(chalk.green(`✅ Found ${audioTracks.length} audio track(s):`));
-        audioTracks.forEach((t, i) => {
-          console.log(chalk.cyan(`  ${i + 1}. ${t.title} (${t.language}) - ${t.codec} ${t.channels}ch ${t.default ? '⭐' : ''}`));
+        console.log(chalk.green('  ✅ Found:'), audioStreams.length, 'audio,', subtitleStreams.length, 'subtitle tracks');
+        audioStreams.forEach((a, i) => {
+          console.log(
+            chalk.gray(`    Audio ${i + 1}:`),
+            chalk.cyan(a.codec),
+            chalk.yellow(`(${a.language})`)
+          );
         });
         
-        console.log(chalk.green(`✅ Found ${subtitleTracks.length} subtitle track(s):`));
-        subtitleTracks.forEach((t, i) => {
-          console.log(chalk.cyan(`  ${i + 1}. ${t.title} (${t.language}) - ${t.codec} ${t.default ? '⭐' : ''}`));
-        });
-        
-        resolve({
-          audio: audioTracks,
-          subtitles: subtitleTracks
-        });
+        resolve({ audio: audioStreams, subtitles: subtitleStreams, ready: true });
       });
     });
     
     res.json(trackInfo);
   } catch (error) {
-    console.error(chalk.red('❌ Error getting tracks:'), error.message);
-    res.status(500).json({ error: 'Failed to get track information' });
+    console.error(chalk.red('  ❌ FFprobe failed:'), error.message);
+    // Fallback to basic tracks with unknown codec
+    res.json({
+      audio: [{
+        index: 0,
+        streamIndex: 1,
+        codec: 'unknown',
+        language: 'und',
+        languageName: 'Unknown',
+        title: 'Default Audio',
+        channels: 2,
+        default: true,
+        forced: false
+      }],
+      subtitles: [{
+        index: 0,
+        streamIndex: 2,
+        codec: 'unknown',
+        language: 'und',
+        languageName: 'Unknown',
+        title: 'Default Subtitle',
+        default: true,
+        forced: false
+      }],
+      ready: true
+    });
   }
 });
 /* ================================================ */
@@ -2204,7 +2789,7 @@ app.get("/auto-subtitle/:animeName/:episode", async (req, res) => {
       
       // Download the subtitle file
       const fullUrl = subtitleUrl.startsWith('http') ? subtitleUrl : `https://animetosho.org${subtitleUrl}`;
-      const subResponse = await fetch(fullUrl);
+      const subResponse = await withTimeout((signal) => fetch(fullUrl, { signal }), 10000);
       const subtitleContent = await subResponse.text();
       
       // Convert to VTT if SRT
@@ -2228,107 +2813,218 @@ app.get("/auto-subtitle/:animeName/:episode", async (req, res) => {
 });
 /* ============================================================= */
 
-/* ========== ADAPTIVE BITRATE STREAMING (HLS) ========== */
-// 🍎 Apple HLS Support - Multi-bitrate streaming
-// HLS cache directory
-const hlsCacheDir = path.join(__dirname, 'hls_cache');
-if (!fs.existsSync(hlsCacheDir)) {
-  fs.mkdirSync(hlsCacheDir, { recursive: true });
+/* ========== ADAPTIVE BITRATE STREAMING (DASH) ========== */
+// 🎬 MPEG-DASH Support - Better than HLS
+// DASH cache directory
+const dashCacheDir = path.join(__dirname, 'dash_cache');
+if (!fs.existsSync(dashCacheDir)) {
+  fs.mkdirSync(dashCacheDir, { recursive: true });
 }
 
-// 🚀 OPTIMIZED HLS - Multi-quality adaptive streaming
-app.get("/hls/:magnet/:filename/master.m3u8", async (req, res) => {
+// MPEG-DASH endpoint (better than HLS)
+app.get("/dash/:magnet/:filename/manifest.mpd", async (req, res) => {
   let magnet = req.params.magnet;
   let filename = decodeURIComponent(req.params.filename);
   
-  console.log(chalk.cyan('🎥 === HLS REQUEST (ADAPTIVE) ==='));
-  console.log(chalk.yellow('  File:'), filename);
+  console.log(chalk.cyan('🎥 === MPEG-DASH İSTEĞİ (Better than HLS) ==='));
+  console.log(chalk.yellow('  Dosya:'), filename);
   
   let tor = await client.get(magnet);
   if (!tor) {
-    return res.status(404).send('Torrent not found');
+    return res.status(404).send('Torrent bulunamadı');
   }
   
   const videoFile = tor.files.find(f => f.name === filename);
   if (!videoFile) {
-    return res.status(404).send('Video file not found');
+    return res.status(404).send('Video dosyası bulunamadı');
   }
   
   const videoPath = path.join(tor.path, videoFile.path);
   
-  // Wait for file
+  // 🔥 WAIT FOR ENOUGH DATA: Need at least 50MB or 10% to get accurate duration
+  const MIN_DOWNLOAD = Math.min(50 * 1024 * 1024, videoFile.length * 0.1); // 50MB or 10%
   let retries = 0;
-  while (!fs.existsSync(videoPath) && retries < 10) {
+  const MAX_RETRIES = 60; // 60 seconds max wait
+  
+  console.log(chalk.cyan(`  ⏳ Waiting for ${(MIN_DOWNLOAD / 1024 / 1024).toFixed(1)}MB to ensure accurate duration...`));
+  
+  while (videoFile.downloaded < MIN_DOWNLOAD && retries < MAX_RETRIES) {
     await new Promise(resolve => setTimeout(resolve, 1000));
     retries++;
+    if (retries % 5 === 0) {
+      console.log(chalk.yellow(`  📉 Buffering... ${(videoFile.downloaded / 1024 / 1024).toFixed(2)}MB / ${(videoFile.length / 1024 / 1024).toFixed(2)}MB (${(videoFile.downloaded / videoFile.length * 100).toFixed(1)}%)`));
+    }
   }
   
-  if (!fs.existsSync(videoPath)) {
-    return res.status(404).send('Video not ready');
+  if (videoFile.downloaded < MIN_DOWNLOAD) {
+    return res.status(503).send(`Video buffering... ${(videoFile.downloaded / videoFile.length * 100).toFixed(0)}% ready. Retry in 10 seconds.`);
   }
   
-  // Create cache dir for this video
+  console.log(chalk.green(`✅ Buffer ready: ${(videoFile.downloaded / 1024 / 1024).toFixed(1)}MB`));
+  
+  console.log(chalk.green('✅ Enough data buffered, starting DASH generation...'));
+  
+  // Video için cache dizini oluştur
   const videoHash = Buffer.from(filename).toString('base64').replace(/[/+=]/g, '_');
-  const videoCacheDir = path.join(hlsCacheDir, videoHash);
-  const masterPlaylistPath = path.join(videoCacheDir, 'master.m3u8');
+  const videoCacheDir = path.join(dashCacheDir, videoHash);
+  const manifestPath = path.join(videoCacheDir, 'manifest.mpd');
   
-  // Check cache
-  if (fs.existsSync(masterPlaylistPath)) {
-    console.log(chalk.green('✅ Using cached HLS'));
-    const playlist = fs.readFileSync(masterPlaylistPath, 'utf-8');
-    res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+  // Cache kontrolü
+  if (fs.existsSync(manifestPath)) {
+    console.log(chalk.green('✅ Önbellek DASH kullanılıyor'));
+    const manifest = fs.readFileSync(manifestPath, 'utf-8');
+    res.setHeader('Content-Type', 'application/dash+xml');
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Cache-Control', 'public, max-age=3600');
-    return res.send(playlist);
+    return res.send(manifest);
   }
   
   if (!fs.existsSync(videoCacheDir)) {
     fs.mkdirSync(videoCacheDir, { recursive: true });
   }
   
-  console.log(chalk.cyan('🔄 Creating HLS stream (COPY mode - no re-encode, instant!)...'));
-  
-  try {
-    // 🔥 TRANSMUX ONLY - No re-encoding! Just copy streams
-    const qualities = [
-      { name: 'original', copy: true }, // Copy mode - instant!
-    ];
+      console.log(chalk.cyan('🔄 MPEG-DASH stream oluşturuluyor (PROGRESSIVE - ilk segment hemen!)...'));
+    
+    try {
+      // 🚀 PROGRESSIVE DASH - Start playback ASAP
+      const qualities = [
+        { name: 'original', copy: true },
+      ];
     
     const variantPromises = qualities.map((quality, idx) => {
-      return new Promise((resolve, reject) => {
-        const playlistName = `stream.m3u8`;
+      return new Promise(async (resolve, reject) => {
+        const playlistName = `${idx}-stream.m3u8`;
         const playlistPath = path.join(videoCacheDir, playlistName);
         
-        console.log(chalk.yellow(`  🎬 Transmuxing (COPY all streams - instant!)...`));
+        console.log(chalk.yellow(`  🎬 DASH çalışıyor (video COPY, audio AAC'ye dönüştürülüyor)...`));
         
-        // 🔥 COPY MODE - No re-encoding, just remux MKV to HLS!
+        // 🔥 PROBE FULL DURATION - Critical for correct HLS generation
+        let videoDuration = 0;
+        let retryProbe = 0;
+        
+        while (videoDuration === 0 && retryProbe < 5) {
+          try {
+            videoDuration = await new Promise((resolve, reject) => {
+              ffmpeg.ffprobe(videoPath, (err, metadata) => {
+                if (err) {
+                  console.error(chalk.red('FFprobe error:'), err.message);
+                  reject(err);
+                  return;
+                }
+                const duration = metadata.format.duration || 0;
+                console.log(chalk.cyan(`  ⏱️ Probed duration: ${Math.floor(duration / 60)}m ${Math.floor(duration % 60)}s`));
+                resolve(duration);
+              });
+            });
+            
+            if (videoDuration > 0) {
+              console.log(chalk.green(`  ✅ Video duration confirmed: ${Math.floor(videoDuration / 60)}m ${Math.floor(videoDuration % 60)}s`));
+              break;
+            }
+          } catch (err) {
+            retryProbe++;
+            console.error(chalk.yellow(`  ⚠️ Probe attempt ${retryProbe} failed, retrying...`));
+            await new Promise(r => setTimeout(r, 2000));
+          }
+        }
+        
+        if (videoDuration === 0) {
+          console.error(chalk.red('❌ Could not determine video duration'));
+          reject(new Error('Cannot determine video duration'));
+          return;
+        }
+        
         const args = [
+          // 🔥 INPUT OPTIONS (before -i) - FAST!
+          '-analyzeduration', '50M',  // Reduced for speed
+          '-probesize', '50M',
+          '-fflags', '+fastseek+genpts',  // Fast seeking
+          '-threads', '0',  // Use all CPU cores
           '-i', videoPath,
-          '-c', 'copy',                         // 🔥 Copy all streams (no encode!)
-          '-map', '0',                          // 🔥 Include ALL streams
-          '-bsf:a', 'aac_adtstoasc',           // Fix AAC for HLS
-          '-start_number', '0',
-          '-hls_time', '4',                     // 4-second segments
-          '-hls_list_size', '15',               // 🔥 Keep only 15 segments (60s buffer)
-          '-hls_flags', 'delete_segments+omit_endlist', // 🔥 Auto-delete old!
-          '-hls_segment_type', 'mpegts',
-          '-hls_segment_filename', path.join(videoCacheDir, 'seg%03d.ts'),
-          '-f', 'hls',
-          playlistPath
+          // 🔥 OUTPUT OPTIONS (after -i)
+          // Video stream
+          '-map', '0:v:0',
+          '-c:v', 'copy',  // No re-encoding!
+          // Audio stream (transcode to AAC for browser compatibility)
+          '-map', '0:a:0',
+          '-c:a', 'aac',
+          '-ac', '2',
+          '-b:a', '128k',
+          '-ar', '48000',
+          // 🔥 KEYFRAME SETTINGS (output options!)
+          '-force_key_frames', 'expr:gte(t,n_forced*6)',
+          '-g', '180',  // GOP size (6 sec * 30 fps)
+          '-sc_threshold', '0',
+          // 📦 MPEG-DASH FORMAT
+          '-f', 'dash',
+          '-seg_duration', '4',  // 🔥 4 second segments (faster initial response!)
+          '-window_size', '5',   // Keep only 5 segments in manifest (low RAM!)
+          '-extra_window_size', '10',  // Keep 10 extra for seeking
+          '-use_template', '1',
+          '-use_timeline', '1',
+          '-init_seg_name', `init-stream${idx}.m4s`,
+          '-media_seg_name', `chunk-stream${idx}-$Number%05d$.m4s`,
+          '-adaptation_sets', 'id=0,streams=v id=1,streams=a',
+          '-single_file', '0',
+          '-streaming', '1',
+          // Note: remove '-ldash' for broader ffmpeg compatibility
+          manifestPath
         ];
         
         const proc = spawn(ffmpegPath.path, args);
         
+        let firstSegmentCreated = false;
         let lastLog = 0;
+        let errorLog = [];
+        
         proc.stderr.on('data', (data) => {
           const output = data.toString();
-          // Show progress every 5 seconds
+          errorLog.push(output);
+          
+          // 🔥 Check if DASH manifest and first segments exist
+          if (!firstSegmentCreated && fs.existsSync(manifestPath)) {
+            try {
+              // Check for manifest + at least 2 segment files
+              const cacheFiles = fs.readdirSync(videoCacheDir);
+              const segmentFiles = cacheFiles.filter(f => f.includes('chunk-stream'));
+              
+              if (segmentFiles.length >= 2) {
+                firstSegmentCreated = true;
+                console.log(chalk.green(`    ✅ İlk ${segmentFiles.length} segment hazır - Instant playback!`));
+                resolve({ name: playlistName, copy: true, idx: idx });
+              }
+            } catch (err) {
+              // Ignore errors, will retry
+            }
+          }
+          
+          // İlerleme göster + Early manifest check
           if (output.includes('time=')) {
             const now = Date.now();
-            if (now - lastLog > 5000) {
-              const match = output.match(/time=(\d+):(\d+):(\d+)/);
+            
+            // Check for early manifest availability every second
+            if (now - lastLog > 1000 && !firstSegmentCreated) {
+              if (fs.existsSync(manifestPath)) {
+                const cacheFiles = fs.readdirSync(videoCacheDir);
+                const segmentFiles = cacheFiles.filter(f => f.includes('chunk-stream'));
+                
+                if (segmentFiles.length >= 1) {
+                  firstSegmentCreated = true;
+                  console.log(chalk.green(`    ⚡ INSTANT START! ${segmentFiles.length} segment ready`));
+                  resolve({ name: playlistName, copy: true, idx: idx });
+                }
+              }
+            }
+            
+            if (now - lastLog > 3000) { // Her 3 saniyede log
+              const match = output.match(/time=(\d+):(\d+):(\d+\.\d+)/);
               if (match) {
-                console.log(chalk.gray('    🔄'), `${match[1]}:${match[2]}:${match[3]}`);
+                const hours = parseInt(match[1]);
+                const mins = parseInt(match[2]);
+                const secs = parseFloat(match[3]);
+                const totalSecs = hours * 3600 + mins * 60 + secs;
+                const progress = videoDuration > 0 ? ((totalSecs / videoDuration) * 100).toFixed(1) : '?';
+                console.log(chalk.gray('    🔄'), `${match[1]}:${match[2]}:${Math.floor(secs)} (${progress}%)`);
                 lastLog = now;
               }
             }
@@ -2336,326 +3032,118 @@ app.get("/hls/:magnet/:filename/master.m3u8", async (req, res) => {
         });
         
         proc.on('close', (code) => {
-          if (code === 0) {
-            console.log(chalk.green(`    ✅ Transmux complete (COPY mode)`));
-            resolve({ name: playlistName, copy: true });
+          if (code === 0 || code === null) {
+            console.log(chalk.green(`    ✅ DASH tamamlandı`));
+            if (!firstSegmentCreated) {
+              resolve({ name: playlistName, copy: true, idx: idx });
+            }
           } else {
-            console.error(chalk.red(`    ❌ Transmux failed with code ${code}`));
-            reject(new Error(`Transmux failed`));
+            console.error(chalk.red(`    ❌ FFmpeg ${code} koduyla kapandı`));
+            console.error(chalk.red('    📝 FFmpeg error log:'));
+            errorLog.slice(-20).forEach(line => console.error(chalk.gray('      ' + line.trim())));
+            if (!firstSegmentCreated) {
+              reject(new Error(`DASH failed with code ${code}`));
+            }
           }
         });
         
         proc.on('error', (err) => {
-          console.error(chalk.red('    ❌ FFmpeg error:'), err.message);
-          reject(err);
+          console.error(chalk.red('    ❌ FFmpeg hatası:'), err.message);
+          if (!firstSegmentCreated) {
+            reject(err);
+          }
         });
+        
+        // 🔥 Timeout - 60 saniye (video copy hızlı ama audio transcode zaman alır)
+        setTimeout(() => {
+          if (!firstSegmentCreated) {
+            console.error(chalk.red('    ❌ Timeout - İlk segment 60 saniyede oluşmadı'));
+            console.error(chalk.yellow('    ⚠️ FFmpeg hala çalışıyor, arka planda tamamlanacak...'));
+            // Don't kill process - let it finish in background
+            // proc.kill();
+            // Frontend will fallback to direct streaming
+            reject(new Error('DASH timeout - generating in background'));
+          }
+        }, 60000); // 60 seconds
       });
     });
     
     const variants = await Promise.all(variantPromises);
     
-    // Create master playlist
-    let masterContent = '#EXTM3U\n#EXT-X-VERSION:3\n\n';
+    // 🔥 CRITICAL: Wait for manifest file to be created
+    let manifestWaitRetries = 0;
+    while (!fs.existsSync(manifestPath) && manifestWaitRetries < 30) {
+      await new Promise(r => setTimeout(r, 1000));
+      manifestWaitRetries++;
+    }
     
-    variants.forEach(variant => {
-      const bandwidth = parseInt(variant.bitrate) * 1000;
-      masterContent += `#EXT-X-STREAM-INF:BANDWIDTH=${bandwidth},RESOLUTION=${variant.height === 720 ? '1280x720' : '1920x1080'}\n`;
-      masterContent += `${variant.name}\n`;
-    });
+    if (!fs.existsSync(manifestPath)) {
+      throw new Error('Manifest not created after 30 seconds');
+    }
     
-    fs.writeFileSync(masterPlaylistPath, masterContent);
-    console.log(chalk.green('✅ Master playlist created with'), variants.length, 'quality variants');
+    // 🔥 CRITICAL: Verify init segment exists
+    const initSegPath = path.join(videoCacheDir, 'init-stream0.m4s');
+    let initWaitRetries = 0;
+    while (!fs.existsSync(initSegPath) && initWaitRetries < 10) {
+      console.log(chalk.yellow(`    ⏳ Waiting for init segment... (${initWaitRetries + 1}/10)`));
+      await new Promise(r => setTimeout(r, 1000));
+      initWaitRetries++;
+    }
     
-    res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+    if (!fs.existsSync(initSegPath)) {
+      console.log(chalk.red('    ❌ Init segment not found, but continuing...'));
+    } else {
+      console.log(chalk.green('    ✅ Init segment ready'));
+    }
+    
+    console.log(chalk.green('✅ DASH manifest oluşturuldu'));
+
+    // Send the manifest
+    const manifestContent = fs.readFileSync(manifestPath, 'utf-8');
+    res.setHeader('Content-Type', 'application/dash+xml');
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Cache-Control', 'public, max-age=3600');
-    res.send(masterContent);
+    res.send(manifestContent);
     
   } catch (error) {
-    console.error(chalk.red('❌ HLS error:'), error.message);
-    res.status(500).send('HLS conversion failed');
+    console.error(chalk.red('❌ DASH hatası:'), error.message);
+    res.status(500).send('DASH dönüştürme başarısız');
   }
 });
 
-// Serve HLS segments
-app.get("/hls/:magnet/:filename/:segment", async (req, res) => {
+// Serve DASH segments
+app.get("/dash/:magnet/:filename/:segment", async (req, res) => {
   const { magnet, filename, segment } = req.params;
   const videoHash = Buffer.from(decodeURIComponent(filename)).toString('base64').replace(/[/+=]/g, '_');
-  const videoCacheDir = path.join(hlsCacheDir, videoHash);
+  const videoCacheDir = path.join(dashCacheDir, videoHash);
   const segmentPath = path.join(videoCacheDir, segment);
-  
-  if (!fs.existsSync(segmentPath)) {
-    return res.status(404).send('Segment not found');
-  }
-  
-  // Serve with aggressive caching
-  res.setHeader('Content-Type', segment.endsWith('.m3u8') ? 'application/vnd.apple.mpegurl' : 'video/mp2t');
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Cache-Control', 'public, max-age=31536000, immutable'); // 1 year!
-  
-  fs.createReadStream(segmentPath).pipe(res);
-});
 
-// Clear HLS cache
-app.delete("/hls/cache/clear", (req, res) => {
-  try {
-    if (fs.existsSync(hlsCacheDir)) {
-      fs.rmSync(hlsCacheDir, { recursive: true, force: true });
-      fs.mkdirSync(hlsCacheDir, { recursive: true });
-      console.log(chalk.green('✅ HLS cache cleared'));
-    }
-    res.json({ success: true, message: 'Cache cleared' });
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to clear cache' });
-  }
-});
-
-/* OLD HLS CODE - REMOVED FOR BANDWIDTH OPTIMIZATION
-app.get("/hls/:magnet/:filename/master.m3u8", async (req, res) => {
-  let magnet = req.params.magnet;
-  let filename = decodeURIComponent(req.params.filename);
-  
-  console.log(chalk.cyan('\n🎬 === HLS REQUEST ==='));
-  console.log(chalk.yellow('  File:'), filename);
-  
-  let tor = await client.get(magnet);
-  if (!tor) {
-    console.log(chalk.red('❌ Torrent not found'));
-    return res.status(404).send('Torrent not found');
-  }
-  
-  const videoFile = tor.files.find(f => f.name === filename);
-  if (!videoFile) {
-    console.log(chalk.red('❌ Video file not found'));
-    return res.status(404).send('Video file not found');
-  }
-  
-  const videoPath = path.join(tor.path, videoFile.path);
-  
-  // Wait for file to be available
-  let retries = 0;
-  while (!fs.existsSync(videoPath) && retries < 10) {
-    await new Promise(resolve => setTimeout(resolve, 1000));
-    retries++;
-  }
-  
-  if (!fs.existsSync(videoPath)) {
-    console.log(chalk.red('❌ Video file not ready'));
-    return res.status(404).send('Video not ready');
-  }
-  
-  // Create cache directory for this video
-  const videoHash = Buffer.from(filename).toString('base64').replace(/[/+=]/g, '_');
-  const videoCacheDir = path.join(hlsCacheDir, videoHash);
-  const masterPlaylistPath = path.join(videoCacheDir, 'master.m3u8');
-  
-  // Check if already converted
-  if (fs.existsSync(masterPlaylistPath)) {
-    console.log(chalk.green('✅ Using cached HLS playlist'));
-    const playlist = fs.readFileSync(masterPlaylistPath, 'utf-8');
-    res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    return res.send(playlist);
-  }
-  
-  // Create cache directory
-  if (!fs.existsSync(videoCacheDir)) {
-    fs.mkdirSync(videoCacheDir, { recursive: true });
-  }
-  
-  console.log(chalk.cyan('🔄 Converting to HLS...'));
-  console.log(chalk.gray('  Source:'), videoPath);
-  console.log(chalk.gray('  Cache:'), videoCacheDir);
-  
-  try {
-    // Get stream info first
-    const streamInfo = await new Promise((resolve, reject) => {
-      ffmpeg.ffprobe(videoPath, (err, metadata) => {
-        if (err) reject(err);
-        else resolve(metadata);
-      });
-    });
-    
-    const audioStreams = metadata.streams.filter(s => s.codec_type === 'audio');
-    const subtitleStreams = metadata.streams.filter(s => s.codec_type === 'subtitle');
-    
-    console.log(chalk.cyan('📊 Stream Analysis:'));
-    console.log(chalk.yellow('  Audio streams:'), audioStreams.length);
-    console.log(chalk.yellow('  Subtitle streams:'), subtitleStreams.length);
-    
-        // PARALLEL HLS CONVERSION - ULTRA FAST!
-    console.log(chalk.cyan('🚀 Creating HLS playlists (PARALLEL MODE)...'));
-    
-    const audioPlaylists = [];
-    const subtitlePlaylists = [];
-    
-    // Create conversion promises for parallel execution
-    const conversionPromises = [];
-    
-    // Audio tracks conversion
-    audioStreams.forEach((audioStream, audioIdx) => {
-      const lang = audioStream.tags?.language || 'und';
-      const title = audioStream.tags?.title || `Audio ${audioIdx + 1}`;
-      const playlistName = `audio_${audioIdx}.m3u8`;
-      const playlistPath = path.join(videoCacheDir, playlistName);
-      
-      console.log(chalk.yellow(`  🎵 Queueing audio ${audioIdx + 1}:`), title, `(${lang})`);
-      
-      const audioPromise = new Promise((resolve, reject) => {
-        const audioArgs = [
-          '-i', videoPath,
-          '-map', '0:v:0',
-          '-map', `0:a:${audioIdx}`,
-          '-c:v', 'copy',
-          '-c:a', 'copy',
-          '-preset', 'ultrafast',  // FAST!
-          '-start_number', '0',
-          '-hls_time', '4',  // 4-second segments (faster start)
-          '-hls_list_size', '0',
-          '-hls_segment_filename', path.join(videoCacheDir, `audio${audioIdx}_seg%03d.ts`),
-          '-f', 'hls',
-          playlistPath
-        ];
-        
-        const proc = spawn(ffmpegPath.path, audioArgs);
-        
-        proc.stderr.on('data', (data) => {
-          // Silent mode for speed
-        });
-        
-        proc.on('close', (code) => {
-          if (code === 0) {
-            console.log(chalk.green(`    ✅ Audio ${audioIdx + 1} done`));
-            audioPlaylists.push({ index: audioIdx, name: playlistName, lang, title });
-            resolve();
-          } else {
-            reject(new Error(`Audio ${audioIdx + 1} failed`));
-          }
-        });
-        
-        proc.on('error', reject);
-      });
-      
-      conversionPromises.push(audioPromise);
-    });
-    
-    // Subtitle tracks conversion (first 3 only for speed)
-    const maxSubtitles = Math.min(3, subtitleStreams.length);
-    for (let subIdx = 0; subIdx < maxSubtitles; subIdx++) {
-      const subStream = subtitleStreams[subIdx];
-      const lang = subStream.tags?.language || 'und';
-      const title = subStream.tags?.title || `Subtitle ${subIdx + 1}`;
-      const vttName = `subtitle_${subIdx}.vtt`;
-      const vttPath = path.join(videoCacheDir, vttName);
-      
-      console.log(chalk.yellow(`  📝 Queueing subtitle ${subIdx + 1}:`), title, `(${lang})`);
-      
-      const subPromise = new Promise((resolve, reject) => {
-        const subArgs = [
-          '-i', videoPath,
-          '-map', `0:s:${subIdx}`,
-          '-c:s', 'webvtt',
-          '-f', 'webvtt',
-          vttPath
-        ];
-        
-        const proc = spawn(ffmpegPath.path, subArgs);
-        
-        proc.on('close', (code) => {
-          if (code === 0) {
-            console.log(chalk.green(`    ✅ Subtitle ${subIdx + 1} done`));
-            subtitlePlaylists.push({ index: subIdx, name: vttName, lang, title });
-            resolve();
-          } else {
-            // Subtitle extraction failed, skip it
-            console.log(chalk.yellow(`    ⚠️ Subtitle ${subIdx + 1} skipped`));
-            resolve(); // Don't reject, just skip
-          }
-        });
-        
-        proc.on('error', () => resolve()); // Skip on error
-      });
-      
-      conversionPromises.push(subPromise);
-    }
-    
-    // Wait for ALL conversions in parallel
-    console.log(chalk.cyan(`⚡ Starting ${conversionPromises.length} parallel conversions...`));
-    const startTime = Date.now();
-    
-    await Promise.all(conversionPromises);
-    
-    const duration = ((Date.now() - startTime) / 1000).toFixed(1);
-    console.log(chalk.green(`✅ All conversions complete in ${duration}s!`));
-    
-    // Create master playlist
-    console.log(chalk.cyan('📝 Creating master.m3u8...'));
-    
-    let masterContent = '#EXTM3U\n#EXT-X-VERSION:3\n\n';
-    
-    // Add audio renditions
-    audioPlaylists.forEach((playlist, idx) => {
-      masterContent += `#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="${playlist.title}",LANGUAGE="${playlist.lang}",AUTOSELECT=${idx === 0 ? 'YES' : 'NO'},DEFAULT=${idx === 0 ? 'YES' : 'NO'},URI="${playlist.name}"\n`;
-    });
-    
-    // Add subtitle renditions
-    subtitlePlaylists.forEach((playlist, idx) => {
-      masterContent += `#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="${playlist.title}",LANGUAGE="${playlist.lang}",AUTOSELECT=${idx === 0 ? 'YES' : 'NO'},DEFAULT=${idx === 0 ? 'YES' : 'NO'},URI="${playlist.name}"\n`;
-    });
-    
-    // Add stream info
-    masterContent += `\n#EXT-X-STREAM-INF:BANDWIDTH=5000000,CODECS="avc1.640028,mp4a.40.2",AUDIO="audio",SUBTITLES="subs"\n`;
-    masterContent += `${audioPlaylists[0].name}\n`;
-    
-    fs.writeFileSync(masterPlaylistPath, masterContent);
-    console.log(chalk.green('✅ Master playlist:'), audioPlaylists.length, 'audio +', subtitlePlaylists.length, 'subs');
-    
-    // Send master playlist
-    const playlist = fs.readFileSync(masterPlaylistPath, 'utf-8');
-    res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.send(playlist);
-    
-  } catch (error) {
-    console.error(chalk.red('❌ HLS conversion error:'), error.message);
-    res.status(500).send('Error creating HLS stream');
-  }
-});
-
-// Serve HLS segments (ACTIVE)
-app.get("/hls/:magnet/:filename/:segment", async (req, res) => {
-  const { magnet, filename, segment } = req.params;
-  const videoHash = Buffer.from(decodeURIComponent(filename)).toString('base64').replace(/[/+=]/g, '_');
-  const videoCacheDir = path.join(hlsCacheDir, videoHash);
-  const segmentPath = path.join(videoCacheDir, segment);
-  
   if (!fs.existsSync(segmentPath)) {
     console.log(chalk.red('❌ Segment not found:'), segment);
     return res.status(404).send('Segment not found');
   }
-  
+
   // Serve with aggressive caching
-  res.setHeader('Content-Type', segment.endsWith('.m3u8') ? 'application/vnd.apple.mpegurl' : 'video/mp2t');
+  res.setHeader('Content-Type', segment.endsWith('.mpd') ? 'application/dash+xml' : 'video/mp4');
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
-  
+  res.setHeader('Cache-Control', 'public, max-age=31536000, immutable'); // 1 year!
+
   fs.createReadStream(segmentPath).pipe(res);
 });
 
-// Clear HLS cache (ACTIVE)
-app.delete("/hls/cache/clear", (req, res) => {
+// Clear DASH cache
+app.delete("/dash/cache/clear", (req, res) => {
   try {
-    if (fs.existsSync(hlsCacheDir)) {
-      fs.rmSync(hlsCacheDir, { recursive: true, force: true });
-      fs.mkdirSync(hlsCacheDir, { recursive: true });
-      console.log(chalk.green('✅ HLS cache cleared'));
+    if (fs.existsSync(dashCacheDir)) {
+      fs.rmSync(dashCacheDir, { recursive: true, force: true });
+      fs.mkdirSync(dashCacheDir, { recursive: true });
+      console.log(chalk.green('✅ DASH cache cleared'));
     }
     res.json({ success: true, message: 'Cache cleared' });
   } catch (error) {
     res.status(500).json({ error: 'Failed to clear cache' });
   }
 });
-*/
 /* ============================================================= */
 
 // Global error handler
@@ -2683,12 +3171,24 @@ app.get('/health', (req, res) => {
 
 // 🔥 Process error handlers - Prevent crashes
 process.on('uncaughtException', (err) => {
+  const message = err && (err.message || String(err));
+  const isRtcAbort = message.includes('User-Initiated Abort') || message.includes('RTCError');
+  if (isRtcAbort) {
+    console.warn(chalk.yellow('⚠️ Suppressed benign WebRTC abort:'), message);
+    return; // ignore benign WebRTC aborts
+  }
   console.error(chalk.red('❌❌❌ UNCAUGHT EXCEPTION ❌❌❌'));
-  console.error(chalk.red(err.stack));
+  console.error(chalk.red(err.stack || message));
   // Don't exit - keep server running
 });
 
 process.on('unhandledRejection', (reason, promise) => {
+  const message = (reason && (reason.message || String(reason))) || '';
+  const isRtcAbort = message.includes('User-Initiated Abort') || message.includes('RTCError');
+  if (isRtcAbort) {
+    console.warn(chalk.yellow('⚠️ Suppressed benign WebRTC rejection:'), message);
+    return; // ignore benign WebRTC aborts
+  }
   console.error(chalk.red('❌ Unhandled Rejection at:'), promise);
   console.error(chalk.red('Reason:'), reason);
   // Don't exit
@@ -2708,3 +3208,4 @@ app.listen(PORT, HOST, () => {
   console.log(chalk.green(`  ✅ Health: ${HOST}:${PORT}/health`));
   console.log(chalk.green('═══════════════════════════════════════════'));
 });
+

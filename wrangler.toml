@@ -5,9 +5,6 @@ name = "zenshin-cdn"
 main = "cloudflare-worker.js"
 compatibility_date = "2024-01-01"
 
-# Account details (get from Cloudflare dashboard)
-account_id = "YOUR_ACCOUNT_ID"  # https://dash.cloudflare.com -> Workers -> Account ID
-
 # Routes (optional)
 # route = "example.com/*"
 

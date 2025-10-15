@@ -1,7 +1,3 @@
- * 🎥 Google Drive Video Streaming
- * Tamamen ücretsiz, 15GB storage, 750GB/gün bandwidth
- */
-
 const express = require('express');
 const router = express.Router();
 const { google } = require('googleapis');
