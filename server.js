@@ -98,6 +98,7 @@ if (fs.existsSync(localSubsDir)) {
 
 const app = express();
 
+<<<<<<< HEAD
 // === Security/Resilience helpers ===
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '*')
   .split(',')
@@ -146,6 +147,10 @@ const withTimeout = async (promise, ms, onAbort) => {
     clearTimeout(id);
   }
 };
+=======
+// PORT definition moved up for subtitle fetches
+const PORT = process.env.PORT || 64621;
+>>>>>>> 8a312f83796da303e6bcc443882cc02ca33d2b54
 
 // Local server - no proxy needed
 // app.set('trust proxy', 1);
@@ -2821,6 +2826,7 @@ if (!fs.existsSync(dashCacheDir)) {
   fs.mkdirSync(dashCacheDir, { recursive: true });
 }
 
+<<<<<<< HEAD
 // MPEG-DASH endpoint (better than HLS)
 app.get("/dash/:magnet/:filename/manifest.mpd", async (req, res) => {
   let magnet = req.params.magnet;
@@ -2828,6 +2834,14 @@ app.get("/dash/:magnet/:filename/manifest.mpd", async (req, res) => {
   
   console.log(chalk.cyan('🎥 === MPEG-DASH İSTEĞİ (Better than HLS) ==='));
   console.log(chalk.yellow('  Dosya:'), filename);
+=======
+app.get("/hls/:magnet/:filename/master.m3u8", async (req, res) => {
+  let magnet = req.params.magnet;
+  let filename = decodeURIComponent(req.params.filename);
+  
+  console.log(chalk.cyan('🎥 === OPTIMIZED HLS REQUEST (Adaptive + No-Drop) ==='));
+  console.log(chalk.yellow('  File:'), filename);
+>>>>>>> 8a312f83796da303e6bcc443882cc02ca33d2b54
   
   let tor = await client.get(magnet);
   if (!tor) {
@@ -2841,22 +2855,38 @@ app.get("/dash/:magnet/:filename/manifest.mpd", async (req, res) => {
   
   const videoPath = path.join(tor.path, videoFile.path);
   
+<<<<<<< HEAD
   // 🔥 WAIT FOR ENOUGH DATA: Need at least 50MB or 10% to get accurate duration
   const MIN_DOWNLOAD = Math.min(50 * 1024 * 1024, videoFile.length * 0.1); // 50MB or 10%
   let retries = 0;
   const MAX_RETRIES = 60; // 60 seconds max wait
   
   console.log(chalk.cyan(`  ⏳ Waiting for ${(MIN_DOWNLOAD / 1024 / 1024).toFixed(1)}MB to ensure accurate duration...`));
+=======
+  // 🔥 ENHANCED BUFFER WAIT: 200MB or 30% for rock-solid duration/timestamps (no seeking jumps!)
+  const MIN_DOWNLOAD = Math.min(200 * 1024 * 1024, videoFile.length * 0.3); // 200MB or 30%
+  let retries = 0;
+  const MAX_RETRIES = 180; // 3 minutes max (increased for stability)
+  
+  console.log(chalk.cyan(`  ⏳ Waiting for ${(MIN_DOWNLOAD / 1024 / 1024).toFixed(1)}MB to prevent seeking drops...`));
+>>>>>>> 8a312f83796da303e6bcc443882cc02ca33d2b54
   
   while (videoFile.downloaded < MIN_DOWNLOAD && retries < MAX_RETRIES) {
     await new Promise(resolve => setTimeout(resolve, 1000));
     retries++;
+<<<<<<< HEAD
     if (retries % 5 === 0) {
       console.log(chalk.yellow(`  📉 Buffering... ${(videoFile.downloaded / 1024 / 1024).toFixed(2)}MB / ${(videoFile.length / 1024 / 1024).toFixed(2)}MB (${(videoFile.downloaded / videoFile.length * 100).toFixed(1)}%)`));
+=======
+    if (retries % 15 === 0) { // Log every 15s
+      const progress = (videoFile.downloaded / videoFile.length * 100).toFixed(1);
+      console.log(chalk.yellow(`  📉 Buffering: ${(videoFile.downloaded / 1024 / 1024).toFixed(2)}MB / ${(videoFile.length / 1024 / 1024).toFixed(2)}MB (${progress}%)`));
+>>>>>>> 8a312f83796da303e6bcc443882cc02ca33d2b54
     }
   }
   
   if (videoFile.downloaded < MIN_DOWNLOAD) {
+<<<<<<< HEAD
     return res.status(503).send(`Video buffering... ${(videoFile.downloaded / videoFile.length * 100).toFixed(0)}% ready. Retry in 10 seconds.`);
   }
   
@@ -2865,10 +2895,20 @@ app.get("/dash/:magnet/:filename/manifest.mpd", async (req, res) => {
   console.log(chalk.green('✅ Enough data buffered, starting DASH generation...'));
   
   // Video için cache dizini oluştur
+=======
+    const progress = (videoFile.downloaded / videoFile.length * 100).toFixed(0);
+    return res.status(503).send(`Buffering for stability... ${progress}% ready. Retry in 15s.`);
+  }
+  
+  console.log(chalk.green(`✅ Buffer locked: ${(videoFile.downloaded / 1024 / 1024).toFixed(1)}MB - No drops guaranteed!`));
+  
+  // Video cache dir
+>>>>>>> 8a312f83796da303e6bcc443882cc02ca33d2b54
   const videoHash = Buffer.from(filename).toString('base64').replace(/[/+=]/g, '_');
   const videoCacheDir = path.join(dashCacheDir, videoHash);
   const manifestPath = path.join(videoCacheDir, 'manifest.mpd');
   
+<<<<<<< HEAD
   // Cache kontrolü
   if (fs.existsSync(manifestPath)) {
     console.log(chalk.green('✅ Önbellek DASH kullanılıyor'));
@@ -2877,12 +2917,29 @@ app.get("/dash/:magnet/:filename/manifest.mpd", async (req, res) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Cache-Control', 'public, max-age=3600');
     return res.send(manifest);
+=======
+  // Cache check (aggressive, 1 hour TTL)
+  if (fs.existsSync(masterPlaylistPath)) {
+    const cacheTime = fs.statSync(masterPlaylistPath).mtime.getTime();
+    const now = Date.now();
+    if (now - cacheTime < 3600 * 1000) { // 1 hour fresh
+      console.log(chalk.green('⚡ HLS CACHE HIT - Instant adaptive stream!'));
+      const playlist = fs.readFileSync(masterPlaylistPath, 'utf-8');
+      res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Cache-Control', 'public, max-age=3600');
+      return res.send(playlist);
+    } else {
+      console.log(chalk.yellow('🗑️ Cache expired, regenerating...'));
+    }
+>>>>>>> 8a312f83796da303e6bcc443882cc02ca33d2b54
   }
   
   if (!fs.existsSync(videoCacheDir)) {
     fs.mkdirSync(videoCacheDir, { recursive: true });
   }
   
+<<<<<<< HEAD
       console.log(chalk.cyan('🔄 MPEG-DASH stream oluşturuluyor (PROGRESSIVE - ilk segment hemen!)...'));
     
     try {
@@ -2890,8 +2947,57 @@ app.get("/dash/:magnet/:filename/manifest.mpd", async (req, res) => {
       const qualities = [
         { name: 'original', copy: true },
       ];
+=======
+  console.log(chalk.cyan('🔄 Generating OPTIMIZED HLS (4s segments + multi-bitrate - zero buffering!)...'));
+  
+  try {
+    // 🔥 MULTI-BITRATE: 3 qualities for adaptive (low/medium/high)
+    const qualities = [
+      { name: 'low', videoBitrate: '800k', audioBitrate: '64k', resolution: '480x270' },
+      { name: 'medium', videoBitrate: '1500k', audioBitrate: '96k', resolution: '854x480' },
+      { name: 'high', videoBitrate: '3000k', audioBitrate: '128k', resolution: '1920x1080' }
+    ];
+>>>>>>> 8a312f83796da303e6bcc443882cc02ca33d2b54
     
+    // Probe duration with MAX accuracy (1GB probe - fixes timestamp jumps)
+    let videoDuration = 0;
+    let retryProbe = 0;
+    const MAX_PROBE_RETRIES = 15; // More retries
+    while (videoDuration === 0 && retryProbe < MAX_PROBE_RETRIES) {
+      try {
+        videoDuration = await new Promise((resolve, reject) => {
+          ffmpeg.ffprobe(videoPath, {
+            analyzeduration: '1G',  // 1GB analysis (ultra-accurate)
+            probesize: '1G'         // 1GB probe
+          }, (err, metadata) => {
+            if (err) {
+              console.error(chalk.red('Probe error:'), err.message);
+              reject(err);
+              return;
+            }
+            const duration = metadata.format.duration || 0;
+            console.log(chalk.cyan(`  ⏱️ Duration probed (attempt ${retryProbe + 1}): ${Math.floor(duration / 60)}m ${Math.floor(duration % 60)}s`));
+            resolve(duration);
+          });
+        });
+        if (videoDuration > 0) {
+          console.log(chalk.green(`  ✅ Duration locked: ${Math.floor(videoDuration / 60)}m ${Math.floor(videoDuration % 60)}s - Seeking safe!`));
+          break;
+        }
+      } catch (err) {
+        retryProbe++;
+        console.log(chalk.yellow(`  ⚠️ Probe ${retryProbe}/${MAX_PROBE_RETRIES} failed, retrying in 5s...`));
+        await new Promise(r => setTimeout(r, 5000));
+      }
+    }
+    
+    if (videoDuration === 0) {
+      throw new Error('Cannot probe duration - increase buffer');
+    }
+    
+    // Generate variants in parallel
     const variantPromises = qualities.map((quality, idx) => {
+<<<<<<< HEAD
       return new Promise(async (resolve, reject) => {
         const playlistName = `${idx}-stream.m3u8`;
         const playlistPath = path.join(videoCacheDir, playlistName);
@@ -2969,10 +3075,55 @@ app.get("/dash/:magnet/:filename/manifest.mpd", async (req, res) => {
           '-streaming', '1',
           // Note: remove '-ldash' for broader ffmpeg compatibility
           manifestPath
+=======
+      return new Promise((resolve, reject) => {
+        const playlistName = `${idx}-${quality.name}.m3u8`;
+        const playlistPath = path.join(videoCacheDir, playlistName);
+        
+        console.log(chalk.yellow(`  🎬 Generating ${quality.name} (4s segments, ${quality.videoBitrate} video)`));
+        
+        const args = [
+          // 🔥 ULTIMATE TIMESTAMP FIX: No jumps/drops ever
+          '-fflags', '+genpts+igndts+discardcorrupt',  // Generate PTS, ignore DTS, discard corrupt
+          '-avoid_negative_ts', 'make_zero',           // Zero negative TS
+          '-fflags2', '+ihist+force_key_frames',       // Force keyframes for clean seeks
+          '-analyzeduration', '1G',                    // Max analysis
+          '-probesize', '1G',                          // Max probe
+          '-i', videoPath,
+          '-c:v', 'libx264',                           // Re-encode for multi-bitrate (copy too unstable for low)
+          '-preset', 'ultrafast',                      // Fast encoding
+          '-crf', '28',                                // Quality (lower = better, but slower)
+          '-b:v', quality.videoBitrate,                // Video bitrate
+          '-maxrate', `${parseInt(quality.videoBitrate) * 1.2}k`,  // Max rate
+          '-bufsize', `${parseInt(quality.videoBitrate) * 2}k`,    // Buffer
+          '-vf', `scale=${quality.resolution.split('x')[0]}:${quality.resolution.split('x')[1]}:force_original_aspect_ratio=decrease`,  // Scale
+          '-c:a', 'aac',
+          '-b:a', quality.audioBitrate,
+          '-ac', '2',
+          '-ar', '44100',
+          '-map', '0:v:0',
+          '-map', '0:a:0',
+          '-bsf:a', 'aac_adtstoasc',
+          '-g', '48',                                  // GOP size for 4s segments
+          '-keyint_min', '48',
+          '-sc_threshold', '0',
+          '-start_number', '0',
+          '-hls_time', '4',                            // 4s segments - FAST seeking, no lag!
+          '-hls_list_size', '10',                      // Keep last 10 (RAM safe)
+          '-hls_flags', 'independent_segments+delete_segments',  // Independent + auto-clean
+          '-hls_segment_type', 'mpegts',
+          '-hls_segment_filename', path.join(videoCacheDir, `${idx}-seg%05d.ts`),  // 5-digit for multi
+          '-hls_playlist_type', 'vod',
+          '-f', 'hls',
+          playlistPath
+>>>>>>> 8a312f83796da303e6bcc443882cc02ca33d2b54
         ];
         
         const proc = spawn(ffmpegPath.path, args);
+        let firstSegmentReady = false;
+        let progressLog = 0;
         
+<<<<<<< HEAD
         let firstSegmentCreated = false;
         let lastLog = 0;
         let errorLog = [];
@@ -3026,12 +3177,39 @@ app.get("/dash/:magnet/:filename/manifest.mpd", async (req, res) => {
                 const progress = videoDuration > 0 ? ((totalSecs / videoDuration) * 100).toFixed(1) : '?';
                 console.log(chalk.gray('    🔄'), `${match[1]}:${match[2]}:${Math.floor(secs)} (${progress}%)`);
                 lastLog = now;
+=======
+        proc.stderr.on('data', (data) => {
+          const output = data.toString();
+          
+          // Check first 3 segments (for instant start)
+          if (!firstSegmentReady && fs.existsSync(playlistPath)) {
+            try {
+              const content = fs.readFileSync(playlistPath, 'utf-8');
+              const segCount = (content.match(/\.ts/g) || []).length;
+              if (segCount >= 3) {
+                firstSegmentReady = true;
+                console.log(chalk.green(`    ✅ ${quality.name}: First 3 segments ready - Buffer full!`));
+                resolve({ name: playlistName, quality: quality.name, idx });
+>>>>>>> 8a312f83796da303e6bcc443882cc02ca33d2b54
               }
+            } catch {} // Retry next data
+          }
+          
+          // Progress log (every 10s)
+          if (output.includes('time=') && Date.now() - progressLog > 10000) {
+            const match = output.match(/time=(\d+):(\d+):(\d+\.\d+)/);
+            if (match) {
+              const h = parseInt(match[1]), m = parseInt(match[2]), s = parseFloat(match[3]);
+              const total = h*3600 + m*60 + s;
+              const prog = ((total / videoDuration) * 100).toFixed(1);
+              console.log(chalk.gray(`    ${quality.name} 🔄 ${h}:${m}:${Math.floor(s)} (${prog}%)`));
+              progressLog = Date.now();
             }
           }
         });
         
         proc.on('close', (code) => {
+<<<<<<< HEAD
           if (code === 0 || code === null) {
             console.log(chalk.green(`    ✅ DASH tamamlandı`));
             if (!firstSegmentCreated) {
@@ -3044,10 +3222,27 @@ app.get("/dash/:magnet/:filename/manifest.mpd", async (req, res) => {
             if (!firstSegmentCreated) {
               reject(new Error(`DASH failed with code ${code}`));
             }
+=======
+          if (code === 0) {
+            console.log(chalk.green(`    ✅ ${quality.name} HLS complete (${Math.floor(videoDuration/60)}m)`));
+            // Add ENDLIST
+            try {
+              let content = fs.readFileSync(playlistPath, 'utf-8');
+              if (!content.includes('#EXT-X-ENDLIST')) {
+                content += '\n#EXT-X-ENDLIST\n';
+                fs.writeFileSync(playlistPath, content);
+              }
+            } catch {}
+            if (!firstSegmentReady) resolve({ name: playlistName, quality: quality.name, idx });
+          } else {
+            console.error(chalk.red(`    ❌ ${quality.name} FFmpeg exited ${code}`));
+            if (!firstSegmentReady) reject(new Error(`HLS ${quality.name} failed: ${code}`));
+>>>>>>> 8a312f83796da303e6bcc443882cc02ca33d2b54
           }
         });
         
         proc.on('error', (err) => {
+<<<<<<< HEAD
           console.error(chalk.red('    ❌ FFmpeg hatası:'), err.message);
           if (!firstSegmentCreated) {
             reject(err);
@@ -3065,11 +3260,31 @@ app.get("/dash/:magnet/:filename/manifest.mpd", async (req, res) => {
             reject(new Error('DASH timeout - generating in background'));
           }
         }, 60000); // 60 seconds
+=======
+          console.error(chalk.red(`    ❌ ${quality.name} FFmpeg error:`), err.message);
+          if (!firstSegmentReady) reject(err);
+        });
+        
+        // Timeout: 45s for first segments (increased)
+        setTimeout(() => {
+          if (!firstSegmentReady) {
+            console.log(chalk.yellow(`    ⚠️ ${quality.name} timeout - Killing & fallback to medium`));
+            proc.kill();
+            // Fallback: Resolve partial (use medium if high fails)
+            if (quality.name === 'high') resolve({ name: '1-medium.m3u8', quality: 'medium', idx: 1 });
+            else reject(new Error('HLS timeout'));
+          }
+        }, 45000);
+>>>>>>> 8a312f83796da303e6bcc443882cc02ca33d2b54
       });
     });
     
-    const variants = await Promise.all(variantPromises);
+    const variants = await Promise.all(variantPromises).catch(err => {
+      console.log(chalk.yellow('⚠️ Partial variants - using available'));
+      return variants.slice(0, -1); // Drop failed one
+    });
     
+<<<<<<< HEAD
     // 🔥 CRITICAL: Wait for manifest file to be created
     let manifestWaitRetries = 0;
     while (!fs.existsSync(manifestPath) && manifestWaitRetries < 30) {
@@ -3089,6 +3304,22 @@ app.get("/dash/:magnet/:filename/manifest.mpd", async (req, res) => {
       await new Promise(r => setTimeout(r, 1000));
       initWaitRetries++;
     }
+=======
+    // Master playlist: Adaptive switching
+    let masterContent = '#EXTM3U\n#EXT-X-VERSION:6\n#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-AUTOSTART\n';
+    
+    variants.forEach(variant => {
+      const q = qualities[variant.idx];
+      const bandwidth = parseInt(q.videoBitrate.replace('k', '')) * 1000 + parseInt(q.audioBitrate.replace('k', '')) * 1000;
+      masterContent += `#EXT-X-STREAM-INF:BANDWIDTH=${bandwidth},RESOLUTION=${q.resolution},NAME="${q.name.toUpperCase()}"\n`;
+      masterContent += `${variant.name}\n`;
+    });
+    
+    masterContent += '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="English",DEFAULT=YES,AUTOSELECT=YES,LANGUAGE="eng",URI="audio.m3u8"'; // Placeholder for audio
+    
+    fs.writeFileSync(masterPlaylistPath, masterContent);
+    console.log(chalk.green('✅ MASTER HLS ready:'), variants.length, 'variants (4s segments - Zero buffering!)');
+>>>>>>> 8a312f83796da303e6bcc443882cc02ca33d2b54
     
     if (!fs.existsSync(initSegPath)) {
       console.log(chalk.red('    ❌ Init segment not found, but continuing...'));
@@ -3106,6 +3337,7 @@ app.get("/dash/:magnet/:filename/manifest.mpd", async (req, res) => {
     res.send(manifestContent);
     
   } catch (error) {
+<<<<<<< HEAD
     console.error(chalk.red('❌ DASH hatası:'), error.message);
     res.status(500).send('DASH dönüştürme başarısız');
   }
@@ -3113,10 +3345,21 @@ app.get("/dash/:magnet/:filename/manifest.mpd", async (req, res) => {
 
 // Serve DASH segments
 app.get("/dash/:magnet/:filename/:segment", async (req, res) => {
+=======
+    console.error(chalk.red('❌ CRITICAL HLS ERROR:'), error.message);
+    // Fallback: Single low-quality
+    res.status(500).send('HLS fallback: Use /streamfile for direct (adaptive failed)');
+  }
+});
+
+// HLS Segment Serve (geliştirilmiş - error log + cache)
+app.get("/hls/:magnet/:filename/:segment", async (req, res) => {
+>>>>>>> 8a312f83796da303e6bcc443882cc02ca33d2b54
   const { magnet, filename, segment } = req.params;
   const videoHash = Buffer.from(decodeURIComponent(filename)).toString('base64').replace(/[/+=]/g, '_');
   const videoCacheDir = path.join(dashCacheDir, videoHash);
   const segmentPath = path.join(videoCacheDir, segment);
+<<<<<<< HEAD
 
   if (!fs.existsSync(segmentPath)) {
     console.log(chalk.red('❌ Segment not found:'), segment);
@@ -3142,6 +3385,39 @@ app.delete("/dash/cache/clear", (req, res) => {
     res.json({ success: true, message: 'Cache cleared' });
   } catch (error) {
     res.status(500).json({ error: 'Failed to clear cache' });
+=======
+  
+  if (!fs.existsSync(segmentPath)) {
+    console.log(chalk.red('❌ MISSING SEGMENT:'), segment, '- Torrent progress low?');
+    return res.status(404).send('Segment buffering... Retry in 5s.');
+  }
+  
+  res.setHeader('Content-Type', segment.endsWith('.m3u8') ? 'application/vnd.apple.mpegurl' : 'video/mp2t');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Cache-Control', 'public, max-age=86400, immutable'); // 1 day for segments
+  
+  const readStream = fs.createReadStream(segmentPath);
+  readStream.on('error', (err) => {
+    console.error(chalk.red('Segment read error:'), err.message);
+    if (!res.headersSent) res.status(500).send('Segment read failed');
+  });
+  readStream.pipe(res);
+  
+  console.log(chalk.gray('📤 Served segment:'), segment);
+});
+
+// Cache Clear (aynı kalır)
+app.delete("/hls/cache/clear", (req, res) => {
+  try {
+    if (fs.existsSync(hlsCacheDir)) {
+      fs.rmSync(hlsCacheDir, { recursive: true, force: true });
+      fs.mkdirSync(hlsCacheDir, { recursive: true });
+      console.log(chalk.green('🧹 HLS cache cleared - Fresh adaptive streams!'));
+    }
+    res.json({ success: true, message: 'Cache cleared' });
+  } catch (error) {
+    res.status(500).json({ error: 'Clear failed' });
+>>>>>>> 8a312f83796da303e6bcc443882cc02ca33d2b54
   }
 });
 /* ============================================================= */
@@ -3155,8 +3431,6 @@ app.use((err, req, res, next) => {
     ...(process.env.NODE_ENV === 'development' && { stack: err.stack })
   });
 });
-
-const PORT = process.env.PORT || 64621;
 
 // Health check for Render.com
 app.get('/health', (req, res) => {
